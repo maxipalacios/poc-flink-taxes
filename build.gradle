@@ -1,0 +1,37 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.maxipalacios'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    flinkVersion = '1.20.5'
+}
+
+dependencies {
+    compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
+    compileOnly "org.apache.flink:flink-clients:${flinkVersion}"
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+application {
+    mainClass = 'com.maxipalacios.taxes.TaxJob'
+}
+
+test {
+    useJUnitPlatform()
+}
