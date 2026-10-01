@@ -1,0 +1,99 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    command: sleep infinity
+    volumes:
+      - .:/workspace:cached
+    depends_on:
+      - jobmanager
+      - taskmanager
+      - postgres-source
+      - postgres-target
+    networks:
+      - flink
+
+  jobmanager:
+    image: flink:1.20.5-java17
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - ./build/libs:/opt/flink/usrlib
+    networks:
+      - flink
+
+  taskmanager:
+    image: flink:1.20.5-java17
+    command: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    networks:
+      - flink
+
+  postgres-source:
+    image: postgres:17
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    environment:
+      POSTGRES_DB: taxes
+      POSTGRES_USER: flink
+      POSTGRES_PASSWORD: flink
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-source-data:/var/lib/postgresql/data
+      - ./docker/postgres/source/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flink -d taxes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - flink
+
+  postgres-target:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: taxes
+      POSTGRES_USER: flink
+      POSTGRES_PASSWORD: flink
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-target-data:/var/lib/postgresql/data
+      - ./docker/postgres/target/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flink -d taxes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - flink
+
+networks:
+  flink:
+
+volumes:
+  flink-checkpoints:
+  postgres-source-data:
+  postgres-target-data:
