@@ -6,6 +6,9 @@
   "shutdownAction": "stopCompose",
   "remoteUser": "vscode",
   "forwardPorts": [8081, 5432, 5433],
+  "features": {
+    "ghcr.io/devcontainers/features/gradle:1": {}
+  },
   "customizations": {
     "vscode": {
       "extensions": [
