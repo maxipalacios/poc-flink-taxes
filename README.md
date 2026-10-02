@@ -62,6 +62,29 @@ Target:
 psql postgresql://flink:flink@postgres-target:5432/taxes
 ```
 
+### Seed data
+
+The source database is created with the domain model (`tax_calculations`, `merchants`) and seeded on first startup: five merchants plus a backfill of tax calculations covering both tax families (`RET_*` withholdings and `PER_*` perceptions) at multiple rates.
+
+The target database is created with the `certificate_items` table, which stays empty until the Flink pipeline runs.
+
+Initialization scripts run only on an empty data volume. To re-create and re-seed both databases from scratch:
+
+```bash
+docker compose down -v
+docker compose up -d
+```
+
+### Verify the seed data
+
+```bash
+psql postgresql://flink:flink@postgres-source:5432/taxes -c 'SELECT count(*) FROM merchants;'  # expect 5
+
+psql postgresql://flink:flink@postgres-source:5432/taxes -c "SELECT tax_id, count(*), sum(base_tax) AS total_base, sum(tax_amount) AS total_withheld FROM tax_calculations GROUP BY tax_id ORDER BY tax_id;"
+
+psql postgresql://flink:flink@postgres-target:5432/taxes -c 'SELECT count(*) FROM certificate_items;'  # expect 0 until the pipeline runs
+```
+
 ## Build and deploy
 
 Build the fat JAR (from the host, no devcontainer needed; Gradle comes from the `dev` image):
