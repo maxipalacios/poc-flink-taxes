@@ -22,7 +22,7 @@ PostgreSQL source
 PostgreSQL target
 ```
 
-The initial goal is to observe how an initial snapshot and subsequent changes (INSERT, UPDATE, and DELETE) propagate from the source PostgreSQL database to a materialized table in the target PostgreSQL database.
+The goal is to use the PostgreSQL CDC connector to consume changes from the `tax_calculations` and `merchants` tables in the source database, consolidate tax withholdings into certificates with Flink, and materialize them in the target PostgreSQL database.
 
 ## Services
 
@@ -62,34 +62,29 @@ Target:
 psql postgresql://flink:flink@postgres-target:5432/taxes
 ```
 
-The initial source table is `customers` and the target table is `active_customers`.
+## Build and deploy
 
-## CDC exercise
+Build the fat JAR (from the host, no devcontainer needed; Gradle comes from the `dev` image):
 
-Insert a customer:
-
-```sql
-INSERT INTO customers (name, status, balance)
-VALUES ('Maxi', 'ACTIVE', 1000.00);
+```bash
+docker compose run --rm dev bash -lc 'cd /workspace && gradle --no-daemon shadowJar'
 ```
 
-Update the balance:
+The bare form without `bash -lc 'cd /workspace'` does not work: the one-off container starts in `/`, not in the mounted repo. Inside the devcontainer (VS Code) you can run `gradle shadowJar` directly.
 
-```sql
-UPDATE customers
-SET balance = 2500.00
-WHERE name = 'Maxi';
+Submit the job to the running cluster:
+
+```bash
+docker compose exec jobmanager flink run -c com.maxipalacios.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar
 ```
 
-Change the customer status:
+`build/libs` is mounted into the JobManager at `/opt/flink/usrlib`, so no manual copy is needed. If you run `gradle clean` while the cluster is up, recreate the services so the mount picks up the new build directory (`docker compose up -d --force-recreate jobmanager taskmanager`). If the `flink-checkpoints` volume was just created, make it writable by the Flink user once:
 
-```sql
-UPDATE customers
-SET status = 'INACTIVE'
-WHERE name = 'Maxi';
+```bash
+docker compose exec jobmanager chown flink:flink /opt/flink/checkpoints
 ```
 
-The Flink pipeline will be added in the next step to observe the changelog and materialize only ACTIVE customers.
+Then watch the job in the Flink Web UI at http://localhost:8081 (job graph, logs, and the "Checkpoints" tab, which should show completed checkpoints every 10 seconds).
 
 ## PostgreSQL CDC
 
@@ -105,9 +100,7 @@ This allows the Flink PostgreSQL CDC connector to consume the WAL through Postgr
 
 ## Next steps
 
-1. Add the PostgreSQL CDC connector to the Flink runtime.
-2. Create the Flink SQL `customers_source` table.
-3. Create the JDBC sink for `active_customers`.
-4. Run `INSERT INTO ... SELECT ... WHERE status = 'ACTIVE'`.
-5. Test the initial snapshot and subsequent INSERT, UPDATE, and DELETE operations.
-6. Enable and observe checkpoints and recovery.
+1. Create the Flink SQL source tables for `tax_calculations` and `merchants`, backed by the PostgreSQL CDC connector.
+2. Consolidate tax withholdings into certificates with an aggregation over tumbling certification periods.
+3. Upsert the resulting certificates into the target database via the JDBC connector.
+4. Enable and observe checkpoints and recovery.

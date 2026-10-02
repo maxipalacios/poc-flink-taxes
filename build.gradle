@@ -1,6 +1,7 @@
 plugins {
     id 'java'
     id 'application'
+    id 'com.gradleup.shadow' version '8.3.9'
 }
 
 group = 'com.maxipalacios'
@@ -15,8 +16,13 @@ ext {
 }
 
 dependencies {
+    // Flink core is provided by the cluster at runtime, so it must not be packaged.
     compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
     compileOnly "org.apache.flink:flink-clients:${flinkVersion}"
+
+    implementation 'org.apache.flink:flink-sql-connector-postgres-cdc:3.6.0-1.20'
+    implementation 'org.apache.flink:flink-connector-jdbc:3.3.0-1.20'
+    implementation 'org.postgresql:postgresql:42.7.7'
 
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
@@ -31,6 +37,19 @@ java {
 application {
     mainClass = 'com.maxipalacios.taxes.TaxJob'
 }
+
+// Flink discovers table factories via META-INF/services and several connector
+// jars register under the same service file; merging keeps every entry.
+shadowJar {
+    archiveClassifier = 'all'
+    mergeServiceFiles()
+    manifest {
+        attributes 'Main-Class': application.mainClass.get()
+    }
+}
+
+// Make plain `gradle build` produce the fat JAR.
+assemble.dependsOn shadowJar
 
 test {
     useJUnitPlatform()
