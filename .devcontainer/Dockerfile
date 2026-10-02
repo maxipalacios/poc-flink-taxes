@@ -16,4 +16,9 @@ RUN curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSIO
     && ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
     && rm /tmp/gradle.zip
 
+# Pre-create the Gradle home so the `gradle-cache` volume in docker-compose.yml
+# mounts with vscode ownership instead of root, keeping dependency downloads
+# cached across one-off `docker compose run` containers.
+RUN mkdir -p /home/vscode/.gradle && chown vscode:vscode /home/vscode/.gradle
+
 USER vscode

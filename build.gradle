@@ -19,6 +19,7 @@ dependencies {
     // Flink core is provided by the cluster at runtime, so it must not be packaged.
     compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
     compileOnly "org.apache.flink:flink-clients:${flinkVersion}"
+    compileOnly "org.apache.flink:flink-table-api-java-bridge:${flinkVersion}"
 
     implementation 'org.apache.flink:flink-sql-connector-postgres-cdc:3.6.0-1.20'
     implementation 'org.apache.flink:flink-connector-jdbc:3.3.0-1.20'
@@ -26,6 +27,22 @@ dependencies {
 
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+
+    // Same Flink jars the cluster provides (the dist ships the table API uber
+    // jar, the planner loader and the table runtime); needed here to run the
+    // job in-process on the mini-cluster inside the e2e tests.
+    testImplementation "org.apache.flink:flink-streaming-java:${flinkVersion}"
+    testImplementation "org.apache.flink:flink-clients:${flinkVersion}"
+    testImplementation "org.apache.flink:flink-table-api-java-bridge:${flinkVersion}"
+    testImplementation "org.apache.flink:flink-table-runtime:${flinkVersion}"
+    testImplementation "org.apache.flink:flink-table-planner-loader:${flinkVersion}"
+
+    testImplementation 'org.testcontainers:testcontainers:1.21.3'
+    testImplementation 'org.testcontainers:postgresql:1.21.3'
+    testImplementation 'org.awaitility:awaitility:4.3.0'
+
+    testRuntimeOnly 'org.apache.logging.log4j:log4j-core:2.24.3'
+    testRuntimeOnly 'org.apache.logging.log4j:log4j-slf4j-impl:2.24.3'
 }
 
 java {
