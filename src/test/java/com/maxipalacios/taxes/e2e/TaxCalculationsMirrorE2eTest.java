@@ -11,7 +11,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.Optional;
 
-import com.maxipalacios.taxes.MirrorConfig;
+import com.maxipalacios.taxes.PipelineConfig;
 import com.maxipalacios.taxes.TaxJob;
 
 import org.apache.flink.core.execution.JobClient;
@@ -51,7 +51,7 @@ class TaxCalculationsMirrorE2eTest {
     void mirrorsSourceTaxCalculationsThroughCdc() throws Exception {
         TableResult result = null;
         try (PostgresPair pair = PostgresPair.start()) {
-            MirrorConfig cfg = new MirrorConfig(
+            PipelineConfig cfg = new PipelineConfig(
                     pair.sourceHost(),
                     Integer.toString(pair.sourcePort()),
                     pair.targetHost(),
@@ -169,9 +169,18 @@ class TaxCalculationsMirrorE2eTest {
         return queryOneMirroredRow(pair, sql, statement -> statement.setLong(1, id));
     }
 
+    /**
+     * The seed carries two rows under this business key (the planted
+     * missing-master-data row and a later one), so the probe must pick one
+     * deterministically: the oldest one is the missing-master-data row this
+     * probe inspects. Without the ORDER BY the outcome would depend on the
+     * physical tuple order, which the sink's idempotent upserts shuffle (each
+     * ON CONFLICT DO UPDATE moves the tuple to the heap end).
+     */
     private Optional<MirroredRow> fetchSeedRowByBusinessKey(PostgresPair pair) {
         String sql = "SELECT id, cuit, tax_amount, created_at FROM tax_calculations_mirror "
-                + "WHERE cuit = ? AND tax_id = ?";
+                + "WHERE cuit = ? AND tax_id = ? "
+                + "ORDER BY id LIMIT 1";
         return queryOneMirroredRow(pair, sql, statement -> {
             statement.setString(1, SNAPSHOT_ROW_CUIT);
             statement.setString(2, SNAPSHOT_ROW_TAX_ID);
