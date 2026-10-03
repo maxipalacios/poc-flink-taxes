@@ -41,14 +41,30 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>one rate line per (cuit, tax_id, certification period, tax_rate), with
  *       exact DECIMAL totals;</li>
  *   <li>certification periods are 60-second tumbling windows of the source
- *       {@code created_at};</li>
+ *       {@code created_at} — this suite runs the default period size (every
+ *       test passes "60s" explicitly); issue #7's other period specs ("1s",
+ *       "daily", "monthly") are pinned by their own suite,
+ *       {@code CertificationPeriodE2eTest};</li>
  *   <li>emission is incremental: each source insert upserts the live
  *       certificate, and rows stop changing once their period closes;</li>
  *   <li>merchant enrichment (issue #6): CUITs without a merchant row
  *       consolidate with SQL NULL merchant columns (LEFT join), and
  *       enrichment only ever appears for CUITs that have master data in the
- *       source.</li>
+ *       source;</li>
+ *   <li>the issue #7 late-arrival drop: a calculation whose created_at is
+ *       already below the source watermark when it arrives (more than the
+ *       5-second bounded out-of-orderness behind newer events) never
+ *       consolidates.</li>
  * </ul>
+ *
+ * <p><b>Snapshot-row recipe.</b> This suite plants its snapshot rows with
+ * the recipe documented in full in {@code CertificationPeriodE2eTest}'s
+ * javadoc (issue #7 mechanics, verified empirically): the CDC snapshot's
+ * delivery order is scrambled, so with the late-arrival filter any snapshot
+ * row older than an already-delivered newer row would be dropped — the seed's
+ * own rows included. The suites therefore delete the seed's calculations and
+ * plant exactly the rows they assert on (all within a five-second band here),
+ * streaming everything dated after the band.
  */
 class CertificateConsolidationE2eTest {
 
@@ -56,31 +72,46 @@ class CertificateConsolidationE2eTest {
     private static final Duration STREAMING_CONVERGENCE = Duration.ofSeconds(60);
 
     /**
-     * Settle wait after starting the job before any streaming insert the test
-     * asserts on: the incremental CDC source probes for its streaming resume
-     * position for roughly the first ~12 seconds (observed in the job logs)
-     * and rows committed inside that window can be skipped when the stream
-     * starts past them. The wait plus the sacrificial warm-up row above keeps
-     * asserted inserts outside that window.
+     * Settle wait after starting the job before the FIRST source record of
+     * the run (warm-up rows and perception ticks included): the incremental
+     * CDC source probes for its streaming resume position for roughly the
+     * first ~12 seconds (observed in the job logs), and records committed
+     * inside that window can be skipped when the stream starts past them —
+     * worse, a tick dance committed inside it raced the snapshot's chunk
+     * commit and permanently dropped snapshot rows behind an already-advanced
+     * watermark (diagnosed against a side-by-side mirror run: the mirror
+     * delivered every row the consolidation pipeline lost; waiting this settle
+     * out before the first tick made every run materialize completely).
+     * Asserted inserts start only after this wait.
      */
     private static final long STREAM_ANCHOR_SETTLE_MILLIS = 15_000;
 
     /**
      * Real-time gap long enough that both CDC inputs have certainly flipped
      * to idle (2-second table.exec.source.idle-timeout) between the two
-     * perception flushes of the snapshot test, so the second flush
-     * re-activates the tax input and releases its watermark into the
-     * combined one. Distinct from {@link #STREAM_ANCHOR_SETTLE_MILLIS}: this
-     * wait spaces out flushes, it does not gate when asserted rows are
-     * inserted.
+     * perception ticks of the snapshot test, so the second tick re-activates
+     * the tax input and releases its watermark into the combined one.
+     * Distinct from {@link #STREAM_ANCHOR_SETTLE_MILLIS}: this wait spaces
+     * out ticks, it does not gate when asserted rows are inserted.
      */
     private static final long IDLE_FLIP_SETTLE_MILLIS = 12_000;
 
     /**
-     * Wave 1 (test 2) must land early enough in its minute for wave 2 to
-     * follow while the period is still open: an insert in the last seconds of
-     * a minute could reach the job after the period closed. Inserts are held
-     * back until the running minute is this many seconds old.
+     * Real-time gap between the last row under test and the perception tick:
+     * the tick only pushes the combined watermark past the last row's
+     * created_at if it lands more than the 5-second bounded out-of-orderness
+     * later in real time; 6.5 seconds leaves margin for scheduling and JDBC
+     * round trips. The same gap also protects the rows inserted AFTER a tick:
+     * a row dated its own now() stays above the tick's watermark (tick - 5s).
+     */
+    private static final long TICK_GAP_MILLIS = 6_500;
+
+    /**
+     * Wave 1 (test 2) must land early enough in its minute for wave 2 (dated
+     * wave1Epoch + 3) to follow while the period is still open: an insert in
+     * the last seconds of a minute could reach the job after the period
+     * closed. Inserts are held back until the running minute is this many
+     * seconds old, so wave 2 lands at most at second 52.
      */
     private static final long MINUTE_HEADROOM_SECONDS = 50;
 
@@ -129,56 +160,77 @@ class CertificateConsolidationE2eTest {
     private static final BigDecimal PER_MID_STREAM_BASE = new BigDecimal("1000.00");
     private static final BigDecimal PER_MID_STREAM_AMOUNT = new BigDecimal("210.00");
 
-    // Watermark-flush rows (see flushWatermarkWithPerception): any PER_* row
-    // works because the taxonomy filter drops it, so its money values can
-    // never reach a certificate line.
-    private static final BigDecimal FLUSH_PER_BASE = new BigDecimal("1000.00");
-    private static final BigDecimal FLUSH_PER_AMOUNT = new BigDecimal("210.00");
+    // Perception tick rows (see insertPerceptionTick): any PER_* row works
+    // because the taxonomy filter drops it, so its money values can never
+    // reach a certificate line.
+    private static final BigDecimal PER_TICK_BASE = new BigDecimal("1000.00");
+    private static final BigDecimal PER_TICK_AMOUNT = new BigDecimal("210.00");
 
     @Test
     void consolidatesSnapshotWithholdingsByRateAndFreezesClosedPeriods() throws Exception {
         TableResult result = null;
         try (PostgresPair pair = PostgresPair.start()) {
 
-            // One shared mid-minute instant about 10 minutes in the past: the
-            // +30s offset keeps the rows away from minute boundaries, so every
-            // row floors into the same single, already closed 60-second period
-            // no matter which second the test runs at.
+            // All six rows exist before the job starts, so the CDC snapshot
+            // (not streaming) must consolidate them. Perceptions share the
+            // cuit and must be dropped by the taxonomy filter.
+            //
+            // Snapshot-row recipe (see the class javadoc): the seed's own
+            // calculations are deleted first, so these six are the ONLY rows
+            // the snapshot carries, and they share one ~10-minutes-back
+            // period, one row per consecutive second (+28..+33 of the
+            // 60-second period starting at minuteStart). Within the five-
+            // second band every delivery order the snapshot produces keeps
+            // them above the late-drop filter's watermark, and they all
+            // floor into one single, already closed period no matter which
+            // second the test runs at.
+            deleteSeedTaxCalculations(pair);
             long minuteStart = Instant.now().getEpochSecond() / 60 * 60 - 600;
-            long midMinute = minuteStart + 30;
-
-            // Every row exists before the job starts, so the CDC snapshot (not
-            // streaming) must consolidate it. Perceptions share the cuit and
-            // must be dropped by the taxonomy filter.
-            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, TAX_ID_RET_IVA, IVA_RATE_3_50, IVA_35_BASE_1, IVA_35_AMOUNT_1, midMinute);
-            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, TAX_ID_RET_IVA, IVA_RATE_3_50, IVA_35_BASE_2, IVA_35_AMOUNT_2, midMinute);
-            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, TAX_ID_RET_IVA, IVA_RATE_5_00, IVA_50_BASE, IVA_50_AMOUNT, midMinute);
-            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, "RET_GANANCIAS", GANANCIAS_RATE_3_00, GANANCIAS_BASE, GANANCIAS_AMOUNT, midMinute);
-            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, "PER_IVA", PER_IVA_RATE_21_00, PER_IVA_BASE, PER_IVA_AMOUNT, midMinute);
-            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, "PER_IIBB_CABA", PER_IIBB_RATE_5_00, PER_IIBB_BASE, PER_IIBB_AMOUNT, midMinute);
+            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, TAX_ID_RET_IVA, IVA_RATE_3_50,
+                    IVA_35_BASE_1, IVA_35_AMOUNT_1, minuteStart + 28);
+            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, TAX_ID_RET_IVA, IVA_RATE_3_50,
+                    IVA_35_BASE_2, IVA_35_AMOUNT_2, minuteStart + 29);
+            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, TAX_ID_RET_IVA, IVA_RATE_5_00,
+                    IVA_50_BASE, IVA_50_AMOUNT, minuteStart + 30);
+            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, "RET_GANANCIAS", GANANCIAS_RATE_3_00,
+                    GANANCIAS_BASE, GANANCIAS_AMOUNT, minuteStart + 31);
+            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, "PER_IVA", PER_IVA_RATE_21_00,
+                    PER_IVA_BASE, PER_IVA_AMOUNT, minuteStart + 32);
+            insertSourceCalculationAt(pair, SNAPSHOT_CUIT, "PER_IIBB_CABA", PER_IIBB_RATE_5_00,
+                    PER_IIBB_BASE, PER_IIBB_AMOUNT, minuteStart + 33);
 
             result = startConsolidationJob(pair);
 
             List<RateLine> expected = expectedSnapshotLines(minuteStart);
-            // The temporal join buffers every calculation until the combined
-            // watermark of both inputs passes its created_at (see TaxJob's
-            // consolidation comment). The merchants input idles ~2s after its
-            // snapshot (its watermark is stuck at epoch 0, so idling is the
-            // only way it stops gating the combined watermark), but the race
-            // between the two inputs' idle flips can freeze the combined
-            // watermark below every buffered row: once BOTH inputs are idle,
-            // the combined watermark never recomputes, and a watermark that
-            // arrived while the merchants input was still active stays stuck
-            // in its input's partial watermark. Two perception flushes close
-            // that hole deterministically: the first, dated ~60s ahead of
-            // now, advances the tax input's watermark immediately; the
-            // second, sent after both inputs have certainly gone idle,
-            // re-activates the tax input and releases its watermark into the
-            // combined one. Perceptions never consolidate (taxonomy filter),
-            // so neither flush can alter any asserted line.
-            flushWatermarkWithPerception(pair, SNAPSHOT_CUIT);
+            // The settle wait (see STREAM_ANCHOR_SETTLE_MILLIS) must elapse
+            // before the first tick: records committed inside the CDC source's
+            // streaming-resume probe window race the snapshot's chunk commit
+            // and can permanently drop the snapshot rows this test asserts on.
+            // Then: the temporal join buffers every calculation until the
+            // combined watermark of both inputs passes its created_at (see
+            // TaxJob's consolidation comment). After the snapshot the tax
+            // input's watermark already sits past these rows (the newest row
+            // it read is minutes newer), but the merchants input idles ~2s
+            // after its snapshot (its watermark is stuck at epoch 0, so
+            // idling is the only way it stops gating the combined watermark),
+            // and the race between the two inputs' idle flips can freeze the
+            // combined watermark below every buffered row: once BOTH inputs
+            // are idle, the combined watermark never recomputes, and a
+            // watermark that arrived while the merchants input was still
+            // active stays stuck in its input's partial watermark. Two
+            // perception ticks close that hole deterministically: the first,
+            // dated now, re-activates the tax input and advances its
+            // watermark; the second, sent after both inputs have certainly
+            // gone idle again, re-activates the tax input once more and
+            // releases its watermark into the combined one. The ticks are
+            // always on time for the late-drop filter (the watermark they
+            // must clear is the snapshot's, minutes behind), and perceptions
+            // never consolidate (taxonomy filter), so neither tick can alter
+            // any asserted line.
+            Thread.sleep(STREAM_ANCHOR_SETTLE_MILLIS);
+            insertPerceptionTick(pair, SNAPSHOT_CUIT);
             Thread.sleep(IDLE_FLIP_SETTLE_MILLIS);
-            flushWatermarkWithPerception(pair, SNAPSHOT_CUIT);
+            insertPerceptionTick(pair, SNAPSHOT_CUIT);
             await().atMost(SNAPSHOT_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
@@ -202,11 +254,16 @@ class CertificateConsolidationE2eTest {
             // watermark of both inputs passes its created_at (see TaxJob's
             // consolidation comment), so this lone streaming insert would sit
             // buffered forever: nothing else pushes the watermark past it.
-            // The perception flush below is dated ~60s ahead of everything
-            // already inserted, which advances the watermark past the open
-            // row; perceptions never consolidate, so it cannot alter any
-            // asserted line.
-            flushWatermarkWithPerception(pair, OPEN_PERIOD_CUIT);
+            // The perception tick below is dated now(): after the tick gap it
+            // lands more than 5 real seconds after the open row, so its
+            // watermark (tick - 5s) clears the row's created_at while the row
+            // itself arrived above the late-drop filter's watermark. The old
+            // future-dated flush is gone: it pushed the watermark ~60s ahead
+            // of now, which would make any row dated its own now arrive late
+            // (issue #7). Perceptions never consolidate, so the tick cannot
+            // alter any asserted line.
+            waitForWatermarkTickGap();
+            insertPerceptionTick(pair, OPEN_PERIOD_CUIT);
             await().atMost(STREAMING_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
@@ -242,30 +299,39 @@ class CertificateConsolidationE2eTest {
         try (PostgresPair pair = PostgresPair.start()) {
             result = startConsolidationJob(pair);
 
-            // The incremental CDC source probes for its streaming resume
-            // position for roughly the first ~12 seconds after job start, and
-            // rows committed inside that window can be skipped when the real
-            // stream starts past them (observed as flaky wave-1 losses). A
-            // sacrificial perception row forces that probe to complete, and
-            // the settle wait keeps every asserted insert below outside the
-            // window; perceptions never consolidate, so the warm-up row is
-            // invisible in certificate_items either way.
+            // The settle wait (see STREAM_ANCHOR_SETTLE_MILLIS) must elapse
+            // before the first source record: records committed inside the
+            // CDC source's streaming-resume probe window race the snapshot's
+            // chunk commit and can permanently drop snapshot rows behind an
+            // already-advanced watermark. After the wait, the sacrificial
+            // perception row forces any remaining probe to complete; the
+            // asserted wave inserts below are then safely outside the window,
+            // and the warm-up row itself is invisible in certificate_items
+            // either way (perceptions never consolidate).
+            Thread.sleep(STREAM_ANCHOR_SETTLE_MILLIS);
             insertSourceCalculation(pair, INCREMENTAL_CUIT, "PER_IVA", PER_IVA_RATE_21_00,
                     PER_MID_STREAM_BASE, PER_MID_STREAM_AMOUNT);
-            Thread.sleep(STREAM_ANCHOR_SETTLE_MILLIS);
 
-            // Wave 1 goes into the currently open period (created_at defaults
-            // to now()); aligned to a fresh minute so wave 2 below has room.
+            // Wave 1 carries an EXPLICIT created_at (epoch captured just
+            // before the insert): wave 2 below must be dated relative to it —
+            // both inside one open 60-second period — while still arriving
+            // above the live watermark. Aligned to a fresh minute so wave 2
+            // has room: wave 1 sits at most at second 49, wave 2 (wave1 + 3)
+            // at most at second 52.
             waitUntilMinuteHeadroom();
-            insertSourceCalculation(pair, INCREMENTAL_CUIT, TAX_ID_RET_IVA, IVA_RATE_5_00, WAVE_1_BASE, WAVE_1_AMOUNT);
+            long wave1Epoch = Instant.now().getEpochSecond();
+            insertSourceCalculationAt(pair, INCREMENTAL_CUIT, TAX_ID_RET_IVA, IVA_RATE_5_00, WAVE_1_BASE, WAVE_1_AMOUNT, wave1Epoch);
             // The temporal join buffers every calculation until the combined
             // watermark passes its created_at (see TaxJob's consolidation
             // comment), so wave 1 would never emit on its own: nothing else
-            // is due to arrive before it. The perception flush is dated ~60s
-            // ahead of wave 1, pushing the watermark past both wave 1 and the
-            // mid-period wave 2 pinned below (period_start + 30s); perceptions
-            // never consolidate, so it cannot alter any asserted line.
-            flushWatermarkWithPerception(pair, INCREMENTAL_CUIT);
+            // is due to arrive before it. The perception tick below is dated
+            // now(); after the tick gap it lands more than 5 real seconds
+            // after wave 1, so its watermark (tick - 5s, about wave1Epoch +
+            // 1.5s) clears wave 1 — and wave 1 itself arrived above the
+            // late-drop filter's watermark. Perceptions never consolidate, so
+            // it cannot alter any asserted line.
+            waitForWatermarkTickGap();
+            insertPerceptionTick(pair, INCREMENTAL_CUIT);
 
             AtomicReference<OffsetDateTime> periodStartRef = new AtomicReference<>();
             await().atMost(STREAMING_CONVERGENCE)
@@ -285,24 +351,22 @@ class CertificateConsolidationE2eTest {
                     });
             OffsetDateTime periodStart = periodStartRef.get();
 
-            // Wave 2 hits the same primary key, pinned to mid-period
-            // (window_start + 30s) so it lands inside the same period even if
-            // this code runs near a minute boundary. The perception row
-            // arrives mid-stream; its absence is asserted below, after the
-            // wave-2 upsert proves the pipeline consumed source changes that
-            // came after it.
+            // Wave 2 hits the same primary key, dated wave1Epoch + 3: still
+            // inside wave 1's open period (the headroom guard above holds
+            // wave 1 to at most second 49 of its minute, so +3 seconds cannot
+            // cross the boundary) and still ABOVE the watermark the first
+            // tick left behind (about wave1Epoch + 1.5s), so the late-drop
+            // filter keeps it; the temporal join buffers it until the next
+            // watermark advance, which a quiet stream never produces. The
+            // mid-stream perception row (dated now) and the second tick below
+            // provide that advance; perceptions never consolidate, so neither
+            // can alter any asserted line.
             insertSourceCalculationAt(pair, INCREMENTAL_CUIT, TAX_ID_RET_IVA, IVA_RATE_5_00,
-                    WAVE_2_BASE, WAVE_2_AMOUNT, periodStart.toEpochSecond() + 30);
+                    WAVE_2_BASE, WAVE_2_AMOUNT, wave1Epoch + 3);
             insertSourceCalculation(pair, INCREMENTAL_CUIT, "PER_IVA", PER_IVA_RATE_21_00,
                     PER_MID_STREAM_BASE, PER_MID_STREAM_AMOUNT);
-            // Wave 2 is dated below the watermark the flush above already
-            // pushed (its created_at is pinned mid-period), so it is a late
-            // row: the temporal join buffers it and only emits on the next
-            // watermark advance, which a quiet stream never produces. This
-            // second perception flush, dated ~60s ahead of now, provides that
-            // advance; perceptions never consolidate, so it cannot alter any
-            // asserted line.
-            flushWatermarkWithPerception(pair, INCREMENTAL_CUIT);
+            waitForWatermarkTickGap();
+            insertPerceptionTick(pair, INCREMENTAL_CUIT);
 
             BigDecimal expectedBase = WAVE_1_BASE.add(WAVE_2_BASE);
             BigDecimal expectedAmount = WAVE_1_AMOUNT.add(WAVE_2_AMOUNT);
@@ -352,7 +416,8 @@ class CertificateConsolidationE2eTest {
                 PostgresPair.DATABASE,
                 PostgresPair.USERNAME,
                 PostgresPair.PASSWORD,
-                pair.slotName());
+                pair.slotName(),
+                "60s");
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
         env.enableCheckpointing(5_000);
@@ -360,9 +425,9 @@ class CertificateConsolidationE2eTest {
     }
 
     /** Expected rate lines for the snapshot cuit, in the fetch order (tax_id, then tax_rate). */
-    private static List<RateLine> expectedSnapshotLines(long minuteStart) {
-        OffsetDateTime windowStart = atEpochSecond(minuteStart);
-        OffsetDateTime windowEnd = atEpochSecond(minuteStart + 60);
+    private static List<RateLine> expectedSnapshotLines(long periodStartEpoch) {
+        OffsetDateTime windowStart = atEpochSecond(periodStartEpoch);
+        OffsetDateTime windowEnd = atEpochSecond(periodStartEpoch + 60);
         return List.of(
                 new RateLine(SNAPSHOT_CUIT, "RET_GANANCIAS", windowStart, windowEnd, GANANCIAS_RATE_3_00, null, null,
                         GANANCIAS_BASE, GANANCIAS_AMOUNT),
@@ -446,6 +511,19 @@ class CertificateConsolidationE2eTest {
                         taxAmount.toPlainString(), createdAtEpochSecond));
     }
 
+    /**
+     * Snapshot-row recipe prep (see the class javadoc): removes the seed's
+     * own calculations so the rows a test plants are the ONLY ones the CDC
+     * snapshot carries. The snapshot's delivery order is scrambled (verified
+     * empirically), so any planted row older than an already-delivered newer
+     * row would be dropped by the late-arrival filter; with the seed gone
+     * and the planted rows sharing one five-second band, every delivery order
+     * keeps them. Must run BEFORE the job starts.
+     */
+    private void deleteSeedTaxCalculations(PostgresPair pair) {
+        pair.executeSourceStatement("DELETE FROM tax_calculations");
+    }
+
     private List<RateLine> fetchRateLines(PostgresPair pair, String cuit) {
         String sql = """
                 SELECT cuit, tax_id, window_start, window_end, tax_rate, establishment, merchant_name,
@@ -479,9 +557,10 @@ class CertificateConsolidationE2eTest {
     }
 
     /**
-     * Perceptions are counted globally: the seed carries PER_* rows of its
-     * own, so the taxonomy filter must hold across every merchant, not only
-     * for the cuits a test inserted.
+     * Perceptions are counted globally: tests that keep the seed carry PER_*
+     * rows of the seed's own, and every test adds perception ticks, so the
+     * taxonomy filter must hold across every merchant, not only for the cuits
+     * a test inserted.
      */
     private long countPerceptionLines(PostgresPair pair) {
         return countTargetRows(pair, "SELECT count(*) FROM certificate_items WHERE tax_id LIKE 'PER%'",
@@ -537,17 +616,35 @@ class CertificateConsolidationE2eTest {
     }
 
     /**
-     * Pushes the source watermark past everything already inserted by this
-     * test: the event-time temporal join emits a calculation only once the
-     * combined watermark of both inputs passes its created_at, so a quiet
-     * stream holds its last rows buffered forever (see TaxJob's consolidation
-     * comment). The flush row is a perception dated ~60 seconds ahead of now;
-     * perceptions never consolidate (taxonomy filter), so it can never alter
-     * any asserted line.
+     * Perception tick: a PER_IVA row whose created_at defaults to now(). The
+     * taxonomy filter drops PER_* before anything is written, so the tick can
+     * never touch certificate_items; it only re-activates the tax CDC input
+     * and advances its watermark to (now - 5s), releasing the quiet stream's
+     * buffered rows for emission. It replaces issue #7's previous future-dated
+     * flush: a flush dated ~60s ahead pushed the watermark so far up that
+     * every LATER legitimate row (created_at = its own now) arrived below it
+     * and was dropped by the late-arrival filter, while a now-dated tick
+     * keeps the watermark ~5 seconds behind real time — rows inserted after
+     * the tick gap stay on time.
      */
-    private void flushWatermarkWithPerception(PostgresPair pair, String cuit) {
-        insertSourceCalculationAt(pair, cuit, "PER_IVA", PER_IVA_RATE_21_00,
-                FLUSH_PER_BASE, FLUSH_PER_AMOUNT, Instant.now().getEpochSecond() + 60);
+    private void insertPerceptionTick(PostgresPair pair, String cuit) {
+        insertSourceCalculation(pair, cuit, "PER_IVA", PER_IVA_RATE_21_00,
+                PER_TICK_BASE, PER_TICK_AMOUNT);
+    }
+
+    /**
+     * Real-time gap between the last row under test and the perception tick:
+     * the tick only pushes the combined watermark past the last row's
+     * created_at if it lands more than the 5-second bounded out-of-orderness
+     * later in real time.
+     */
+    private static void waitForWatermarkTickGap() {
+        try {
+            Thread.sleep(TICK_GAP_MILLIS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for the watermark tick gap", e);
+        }
     }
 
     private long countPrimaryKeyRows(PostgresPair pair, String cuit, String taxId,
@@ -582,7 +679,7 @@ class CertificateConsolidationE2eTest {
 
     /**
      * Holds inserts back until the running minute is young enough that wave 2
-     * can still follow inside the same open period.
+     * (dated wave1Epoch + 3) can still follow inside the same open period.
      */
     private static void waitUntilMinuteHeadroom() {
         long secondsIntoMinute = Instant.now().getEpochSecond() % 60;

@@ -109,6 +109,26 @@ docker compose exec jobmanager chown flink:flink /opt/flink/checkpoints
 
 Then watch the job in the Flink Web UI at http://localhost:8081 (job graph, logs, and the "Checkpoints" tab, which should show completed checkpoints every 10 seconds).
 
+## Job configuration
+
+The consolidation job sizes its certification period (the interval over which withholdings consolidate into one certificate) through the `--certification-period` submission flag or the `CERTIFICATION_PERIOD` env var, defaulting to `60s`:
+
+- `<n>s` — a tumbling period of `n` seconds for any `n >= 1` (e.g. `60s`, `1s`).
+- `daily` — one calendar day.
+- `monthly` — one calendar month.
+
+Example submission for daily certificates:
+
+```bash
+docker compose exec jobmanager flink run -c com.maxipalacios.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar --certification-period daily
+```
+
+### Time and late data
+
+- Event time is the calculation's `created_at`, with a 5-second bounded out-of-orderness watermark.
+- Period boundaries align to `America/Argentina/Buenos_Aires`: `daily` periods run local midnight to local midnight, and `monthly` periods run from the first of the local month.
+- A calculation that arrives after the watermark has passed its `created_at` is dropped (allowed lateness is 0); pure-SQL Flink has no late-event recovery. The e2e tests surface this behavior.
+
 ## PostgreSQL CDC
 
 `postgres-source` starts with:

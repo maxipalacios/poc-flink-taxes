@@ -50,8 +50,20 @@ INSERT INTO merchants (cuit, name, establishment) VALUES
     ('27234567894', 'Distribuidora Pampeana S.A.', '10004'),
     ('30234567895', 'Insumos Textiles S.A.',       '10005');
 
--- Backfill of tax calculations, oldest first. tax_amount always equals
+-- Backfill of tax calculations. tax_amount always equals
 -- base_tax * tax_rate / 100 so totals are easy to verify by hand.
+--
+-- Late-data caveat (issue #7): the consolidation pipeline drops any
+-- calculation that arrives more than 5 seconds behind the newest one
+-- already delivered (allowed lateness 0). The CDC snapshot's delivery
+-- order is NOT the insertion order — observed scrambled across runs —
+-- so the oldest backfill rows (the 26-hour ones especially) can be
+-- dropped nondeterministically when a newer row is delivered before
+-- them. That is the documented allowed-lateness-0 limitation, not a
+-- bug: demo certificates built from the backfill may miss rows, while
+-- every row inserted after the job streams consolidates. The e2e tests
+-- sidestep this by deleting the backfill and planting exactly the
+-- snapshot rows they assert on.
 INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate, created_at)
 VALUES
     -- Older backfill (about a day before initialization).

@@ -59,7 +59,8 @@ class TaxCalculationsMirrorE2eTest {
                     PostgresPair.DATABASE,
                     PostgresPair.USERNAME,
                     PostgresPair.PASSWORD,
-                    pair.slotName());
+                    pair.slotName(),
+                    "60s");
 
             StreamExecutionEnvironment env =
                     StreamExecutionEnvironment.getExecutionEnvironment();

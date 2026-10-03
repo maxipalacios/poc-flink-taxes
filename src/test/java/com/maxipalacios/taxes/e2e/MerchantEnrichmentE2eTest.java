@@ -61,6 +61,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * written, so a tick can never touch {@code certificate_items} — asserted
  * globally below.
  *
+ * <p><b>Snapshot-row recipe.</b> This suite plants its snapshot rows with
+ * the recipe documented in full in {@code CertificationPeriodE2eTest}'s
+ * javadoc (issue #7 mechanics, verified empirically): the CDC snapshot's
+ * delivery order is scrambled, so with the late-arrival filter any snapshot
+ * row older than an already-delivered newer row would be dropped — the seed's
+ * own rows included. The suites therefore delete the seed's calculations and
+ * plant exactly the rows they assert on (all within a five-second band here),
+ * streaming everything dated after the band.
+ *
  * <p>Two more pinned behaviors the assertions respect: {@code LAST_VALUE}
  * skips NULL inputs (a merchantless withholding can never clobber an enriched
  * value already aggregated into the same rate line), and the merchants CDC
@@ -83,6 +92,16 @@ class MerchantEnrichmentE2eTest {
     private static final long TICK_GAP_MILLIS = 6_500;
 
     /**
+     * Real-time gap long enough that both CDC inputs have certainly flipped
+     * to idle (2-second table.exec.source.idle-timeout) between the two
+     * perception ticks that release the snapshot-phase row, so the second
+     * tick re-activates the tax input and releases its watermark into the
+     * combined one (the both-inputs-idle freeze race documented in the
+     * consolidation suite's test 1).
+     */
+    private static final long IDLE_FLIP_SETTLE_MILLIS = 12_000;
+
+    /**
      * Part A (test 2) must land early enough in its minute for the whole
      * sequence (first withholding, merchant update, second withholding, tick)
      * to stay inside one open certification period. Stricter than the issue
@@ -91,17 +110,22 @@ class MerchantEnrichmentE2eTest {
     private static final long MINUTE_HEADROOM_SECONDS = 30;
 
     /**
-     * Settle wait after starting the job before any streaming insert the test
-     * asserts on. Two startup windows must pass first: the merchants CDC
-     * snapshot read completes within a few seconds of job start (every
-     * merchant-column expectation relies on the withholdings' created_at
-     * landing after it — the versioned state stamps snapshot records with the
-     * read time, so an as-of lookup against an earlier created_at finds no
-     * version at all), and the incremental tax CDC source probes for its
-     * streaming resume position for roughly the first ~12 seconds (observed
-     * in the job logs), skipping rows committed inside that window. The wait
-     * plus the sacrificial perception warm-up rows keeps asserted inserts
-     * outside both windows.
+     * Settle wait after starting the job before the FIRST source record of
+     * the run (warm-up rows and perception ticks included), and before any
+     * streaming insert the test asserts on. Two startup windows must pass
+     * first: the merchants CDC snapshot read completes within a few seconds
+     * of job start (every merchant-column expectation relies on the
+     * withholdings' created_at landing after it — the versioned state stamps
+     * snapshot records with the read time, so an as-of lookup against an
+     * earlier created_at finds no version at all), and the incremental tax
+     * CDC source probes for its streaming resume position for roughly the
+     * first ~12 seconds (observed in the job logs), skipping rows committed
+     * inside that window — worse, records committed inside it race the
+     * snapshot's chunk commit and can permanently drop snapshot rows behind
+     * an already-advanced watermark (diagnosed against a side-by-side mirror
+     * run: the mirror delivered every row the consolidation pipeline lost;
+     * waiting this settle out before the first tick made every run
+     * materialize completely). Asserted inserts start only after this wait.
      */
     private static final long STREAM_ANCHOR_SETTLE_MILLIS = 15_000;
 
@@ -131,8 +155,8 @@ class MerchantEnrichmentE2eTest {
     private static final String MERCHANTLESS_CUIT = "27777777771";
 
     // Test 1's rates are unused by the seed, so the two lines this test
-    // creates are uniquely identifiable among the seed's own lines for the
-    // cuit (the seed already carries RET_IVA 3.50 and 5.00 lines for it).
+    // creates are uniquely identifiable as this test's own regardless of
+    // what other rows a run carries.
     private static final BigDecimal SNAPSHOT_RATE_4_25 = new BigDecimal("4.25");
     private static final BigDecimal STREAMING_RATE_6_75 = new BigDecimal("6.75");
     private static final BigDecimal MERCHANTLESS_RATE_3_50 = new BigDecimal("3.50");
@@ -172,26 +196,44 @@ class MerchantEnrichmentE2eTest {
         try (PostgresPair pair = PostgresPair.start()) {
 
             // Snapshot phase (before the job starts): one withholding for a
-            // seeded merchant, ~10 minutes back and pinned mid-minute so it
-            // floors into a single, already closed certification period. The
-            // seed's own rows for this cuit are newer still, so the source
-            // watermark after the snapshot already sits past this row's
-            // created_at and it consolidates without needing a tick.
+            // seeded merchant, planted with the snapshot-row recipe (see the
+            // class javadoc): the seed's own calculations are deleted first
+            // and this row is the ONLY snapshot row, ~10 minutes back and
+            // pinned mid-minute so it floors into a single, already closed
+            // certification period no matter which second the test runs at.
+            deleteSeedTaxCalculations(pair);
             long minuteStart = Instant.now().getEpochSecond() / 60 * 60 - 600;
-            long midMinute = minuteStart + 30;
             insertSourceCalculationAt(pair, FARMACITY_CUIT, TAX_ID_RET_IVA, SNAPSHOT_RATE_4_25,
-                    SNAPSHOT_BASE, SNAPSHOT_AMOUNT, midMinute);
+                    SNAPSHOT_BASE, SNAPSHOT_AMOUNT, minuteStart + 30);
 
             result = startConsolidationJob(pair);
+
+            // The settle wait (see STREAM_ANCHOR_SETTLE_MILLIS) must elapse
+            // before the first tick: records committed inside the CDC
+            // source's streaming-resume probe window race the snapshot's
+            // chunk commit and can permanently drop the snapshot rows this
+            // test asserts on. The planted row is then still buffered by the
+            // temporal join until the combined watermark of both inputs
+            // passes its created_at, and the both-inputs-idle freeze race
+            // (documented in the consolidation suite's test 1) can strand
+            // buffered rows. Two now-dated perception ticks — the second
+            // after both inputs have certainly gone idle — release the
+            // combined watermark deterministically; perceptions never
+            // consolidate, so the ticks cannot alter any asserted line.
+            Thread.sleep(STREAM_ANCHOR_SETTLE_MILLIS);
+            insertPerceptionTick(pair);
+            Thread.sleep(IDLE_FLIP_SETTLE_MILLIS);
+            insertPerceptionTick(pair);
 
             // Wait for the snapshot rate line before streaming anything: this
             // proves the snapshot phase ran to completion, so every row
             // inserted below streams while the merchant's snapshot version is
             // already in the join state (op_ts <= now, which pins the as-of
             // lookups of all streaming rows). The line's merchant columns are
-            // pinned to NULL: the snapshot record was read at job start, so
-            // the as-of lookup against this withholding's created_at (10
-            // minutes before the job) finds no merchant version at all.
+            // pinned to NULL: the merchant's only version is stamped with the
+            // job's snapshot read, so the as-of lookup against this
+            // withholding's created_at (10 minutes before the job) finds no
+            // merchant version at all.
             await().atMost(SNAPSHOT_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
@@ -319,19 +361,44 @@ class MerchantEnrichmentE2eTest {
     void reflectsLastMerchantVersionSeenInPeriodAndKeepsClosedCertificatesImmutable() throws Exception {
         TableResult result = null;
         try (PostgresPair pair = PostgresPair.start()) {
+
+            // ---- Part B's closed-period withholding, planted first ----
+            // It used to be inserted while the job streamed with a created_at
+            // ~10 minutes back, but issue #7's late-drop filter kills exactly
+            // that shape: a row arriving below the live watermark is dropped
+            // before the temporal join and never consolidates. So the row is
+            // planted BEFORE the job starts with the snapshot-row recipe (see
+            // the class javadoc): the seed's own calculations are deleted
+            // first and this row is Part B's only snapshot row, ~10 minutes
+            // back and pinned mid-minute — its certification period closed
+            // long ago, and its created_at also predates the merchants
+            // snapshot read, so the as-of lookup finds no merchant version
+            // and the line must consolidate with NULL merchant columns. The
+            // line is captured as read back below and must never change
+            // afterwards.
+            deleteSeedTaxCalculations(pair);
+            long closedMinuteStart = Instant.now().getEpochSecond() / 60 * 60 - 600;
+            insertSourceCalculationAt(pair, ALMACENES_CUIT, TAX_ID_RET_GANANCIAS, GANANCIAS_RATE_3_00,
+                    CLOSED_BASE, CLOSED_AMOUNT, closedMinuteStart + 30);
+
             result = startConsolidationJob(pair);
 
             // ---- Part A: mid-period merchant update -> LAST_VALUE wins ----
-            // Let the merchants snapshot read and the tax CDC streaming probe
-            // settle first (see STREAM_ANCHOR_SETTLE_MILLIS): a sacrificial
-            // perception warm-up row forces the probe to complete, and the
-            // settle wait keeps the withholdings below outside the skip
-            // window. Then hold the sequence back until the running minute is
-            // young enough for both withholdings and the tick to stay inside
-            // one open certification period.
-            insertSourceCalculation(pair, MERCHANTLESS_CUIT, TAX_ID_PER_IVA, PER_TICK_RATE_21_00,
-                    PER_TICK_BASE, PER_TICK_AMOUNT);
+            // The settle wait (see STREAM_ANCHOR_SETTLE_MILLIS) must elapse
+            // before the first source record: records committed inside the
+            // CDC source's streaming-resume probe window race the snapshot's
+            // chunk commit and can permanently drop the snapshot-phase rows
+            // Part B asserts on. Then the double-tick release for those rows
+            // (the both-inputs-idle freeze race, documented in the
+            // consolidation suite's test 1); the ticks are PER_* rows, so
+            // they double as the streaming warm-up and never consolidate.
+            // Finally hold the sequence below back until the running minute
+            // is young enough for both withholdings and the tick to stay
+            // inside one open certification period.
             Thread.sleep(STREAM_ANCHOR_SETTLE_MILLIS);
+            insertPerceptionTick(pair);
+            Thread.sleep(IDLE_FLIP_SETTLE_MILLIS);
+            insertPerceptionTick(pair);
             waitUntilMinuteHeadroom(MINUTE_HEADROOM_SECONDS);
             long periodStart = Instant.now().getEpochSecond() / 60 * 60;
 
@@ -389,23 +456,12 @@ class MerchantEnrichmentE2eTest {
                     });
 
             // ---- Part B: post-close update -> closed certificate immutable ----
-            // A third seeded merchant. The withholding below is inserted while
-            // the job streams but carries a created_at ~10 minutes back: its
-            // certification period closed long ago, and its created_at also
-            // predates the merchants snapshot read, so the as-of lookup finds
-            // no merchant version and the line must consolidate with NULL
-            // merchant columns. The line is captured as read back and must
-            // never change afterwards.
-            long closedMinuteStart = Instant.now().getEpochSecond() / 60 * 60 - 600;
-            insertSourceCalculationAt(pair, ALMACENES_CUIT, TAX_ID_RET_GANANCIAS, GANANCIAS_RATE_3_00,
-                    CLOSED_BASE, CLOSED_AMOUNT, closedMinuteStart + 30);
-
-            // The backdated withholding's emission timer is already behind the
-            // current combined watermark when the row is registered, and Flink
-            // only fires event-time timers on the next watermark ADVANCE — a
-            // quiet stream would leave it buffered forever. The perception
-            // tick below (after the usual gap) provides that advance; it never
-            // consolidates, so it cannot alter the line under test.
+            // The planted withholding sits buffered in the temporal join
+            // until the combined watermark passes it; Part A's ticks have
+            // usually released it already, and the perception tick below
+            // (after the usual gap) guarantees the advance for the
+            // quiet-stream case. It never consolidates, so it cannot alter
+            // the line under test.
             waitForWatermarkTickGap();
             insertPerceptionTick(pair);
 
@@ -497,7 +553,8 @@ class MerchantEnrichmentE2eTest {
                 PostgresPair.DATABASE,
                 PostgresPair.USERNAME,
                 PostgresPair.PASSWORD,
-                pair.slotName());
+                pair.slotName(),
+                "60s");
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
         env.enableCheckpointing(5_000);
@@ -537,6 +594,19 @@ class MerchantEnrichmentE2eTest {
                 VALUES ('%s', '%s', %s, %s, %s, 'CL', 0.00, to_timestamp(%d))
                 """.formatted(cuit, taxId, taxRate.toPlainString(), baseTax.toPlainString(),
                         taxAmount.toPlainString(), createdAtEpochSecond));
+    }
+
+    /**
+     * Snapshot-row recipe prep (see the class javadoc): removes the seed's
+     * own calculations so the rows a test plants are the ONLY ones the CDC
+     * snapshot carries. The snapshot's delivery order is scrambled (verified
+     * empirically), so any planted row older than an already-delivered newer
+     * row would be dropped by the late-arrival filter; with the seed gone
+     * and the planted rows sharing one five-second band, every delivery order
+     * keeps them. Must run BEFORE the job starts.
+     */
+    private void deleteSeedTaxCalculations(PostgresPair pair) {
+        pair.executeSourceStatement("DELETE FROM tax_calculations");
     }
 
     /**

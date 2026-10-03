@@ -1,10 +1,14 @@
 package com.maxipalacios.taxes;
 
 /**
- * Connection coordinates shared by the tax pipelines: where to read the
- * source {@code tax_calculations} table from and where to write in the target
- * database (the {@code certificate_items} consolidation sink, or the
- * {@code tax_calculations_mirror} debugging table for the issue #4 pipeline).
+ * Configuration shared by the tax pipelines: the connection coordinates —
+ * where to read the source {@code tax_calculations} table from and where to
+ * write in the target database (the {@code certificate_items} consolidation
+ * sink, or the {@code tax_calculations_mirror} debugging table for the issue
+ * #4 pipeline) — plus, since issue #7, pipeline parameters beyond connection
+ * coordinates: {@link #certificationPeriodSpec} sizes the consolidation
+ * pipeline's certification periods (see {@link CertificationPeriod} for the
+ * valid forms).
  *
  * <p>The consolidation pipeline (issues #5 and #6) reads two CDC sources from
  * the same database — {@code tax_calculations} and {@code merchants} — so it
@@ -13,7 +17,9 @@ package com.maxipalacios.taxes;
  *
  * <p>{@link #fromEnv()} resolves the docker-compose service names, so
  * {@code flink run} on the cluster needs no configuration; the e2e tests
- * pass container coordinates through the constructor instead.
+ * pass container coordinates through the constructor instead. The period spec
+ * is validated eagerly in the compact constructor, so a bad env var or flag
+ * value fails before any pipeline object exists.
  */
 public record PipelineConfig(
         String sourceHost,
@@ -23,7 +29,14 @@ public record PipelineConfig(
         String databaseName,
         String username,
         String password,
-        String replicationSlotName) {
+        String replicationSlotName,
+        String certificationPeriodSpec) {
+
+    public PipelineConfig {
+        // Fail fast: an invalid spec must surface at construction, not deep
+        // inside the job submission after CDC sources are already declared.
+        CertificationPeriod.parse(certificationPeriodSpec);
+    }
 
     public static PipelineConfig fromEnv() {
         return new PipelineConfig(
@@ -38,7 +51,20 @@ public record PipelineConfig(
                 // runs consolidation, while the mirror pipeline is only
                 // exercised by its e2e test, which passes its own unique slot
                 // name.
-                envOr("CDC_SLOT_NAME", "flink_tax_certificates"));
+                envOr("CDC_SLOT_NAME", "flink_tax_certificates"),
+                // The fallback matches the compose demo default (seed and
+                // README): an unconfigured deployment behaves exactly like the
+                // pre-issue-#7 pipeline with its 60-second periods.
+                envOr("CERTIFICATION_PERIOD", CertificationPeriod.DEFAULT_SPEC));
+    }
+
+    // Returns a copy with the certification period spec overridden. Used by
+    // TaxJob.main so the --certification-period flag can override the
+    // env-resolved value without re-listing every connection coordinate; the
+    // compact constructor re-validates the new spec.
+    public PipelineConfig withCertificationPeriod(String newSpec) {
+        return new PipelineConfig(sourceHost, sourcePort, targetHost, targetPort,
+                databaseName, username, password, replicationSlotName, newSpec);
     }
 
     // Second replication slot for the merchants CDC source (issue #6).
