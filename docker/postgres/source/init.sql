@@ -19,6 +19,13 @@ CREATE TABLE merchants (
     establishment varchar(30)  NOT NULL
 );
 
+-- The enrichment pipeline versions merchant rows by their change time, so
+-- every UPDATE must reach the pipeline with its before image. The default
+-- replica identity only ships the key columns on UPDATE, which the CDC
+-- connector reports as a missing before image and fails the source; FULL
+-- ships the complete old row.
+ALTER TABLE merchants REPLICA IDENTITY FULL;
+
 -- INSERT-only facts: every calculation is new; an existing one is never
 -- corrected (see GLOSSARY.md, "Tax Calculation").
 CREATE TABLE tax_calculations (

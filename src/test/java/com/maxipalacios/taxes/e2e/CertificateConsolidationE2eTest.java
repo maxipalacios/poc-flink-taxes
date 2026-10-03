@@ -10,7 +10,9 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
@@ -28,10 +30,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * End-to-end tests for issue #5: runs the real certificate consolidation job
- * on the in-process mini-cluster against two ephemeral PostgreSQL containers
- * and checks the materialized {@code certificate_items} against the pinned
- * domain semantics:
+ * End-to-end tests for issue #5 (consolidation) and issue #6 (enrichment):
+ * runs the real certificate consolidation job on the in-process mini-cluster
+ * against two ephemeral PostgreSQL containers and checks the materialized
+ * {@code certificate_items} against the pinned domain semantics:
  *
  * <ul>
  *   <li>only withholdings ({@code RET_*} family) consolidate; perceptions
@@ -41,13 +43,38 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>certification periods are 60-second tumbling windows of the source
  *       {@code created_at};</li>
  *   <li>emission is incremental: each source insert upserts the live
- *       certificate, and rows stop changing once their period closes.</li>
+ *       certificate, and rows stop changing once their period closes;</li>
+ *   <li>merchant enrichment (issue #6): CUITs without a merchant row
+ *       consolidate with SQL NULL merchant columns (LEFT join), and
+ *       enrichment only ever appears for CUITs that have master data in the
+ *       source.</li>
  * </ul>
  */
 class CertificateConsolidationE2eTest {
 
     private static final Duration SNAPSHOT_CONVERGENCE = Duration.ofSeconds(90);
     private static final Duration STREAMING_CONVERGENCE = Duration.ofSeconds(60);
+
+    /**
+     * Settle wait after starting the job before any streaming insert the test
+     * asserts on: the incremental CDC source probes for its streaming resume
+     * position for roughly the first ~12 seconds (observed in the job logs)
+     * and rows committed inside that window can be skipped when the stream
+     * starts past them. The wait plus the sacrificial warm-up row above keeps
+     * asserted inserts outside that window.
+     */
+    private static final long STREAM_ANCHOR_SETTLE_MILLIS = 15_000;
+
+    /**
+     * Real-time gap long enough that both CDC inputs have certainly flipped
+     * to idle (2-second table.exec.source.idle-timeout) between the two
+     * perception flushes of the snapshot test, so the second flush
+     * re-activates the tax input and releases its watermark into the
+     * combined one. Distinct from {@link #STREAM_ANCHOR_SETTLE_MILLIS}: this
+     * wait spaces out flushes, it does not gate when asserted rows are
+     * inserted.
+     */
+    private static final long IDLE_FLIP_SETTLE_MILLIS = 12_000;
 
     /**
      * Wave 1 (test 2) must land early enough in its minute for wave 2 to
@@ -59,8 +86,9 @@ class CertificateConsolidationE2eTest {
 
     private static final String TAX_ID_RET_IVA = "RET_IVA";
 
-    // Snapshot cuit (test 1): deliberately absent from the seed's merchants, so
-    // establishment and merchant_name must stay SQL NULL (enrichment is issue #6).
+    // Snapshot cuit (test 1): deliberately absent from the seed's merchants,
+    // so its lines must consolidate with SQL NULL merchant columns (LEFT join:
+    // missing master data must not drop withholdings).
     private static final String SNAPSHOT_CUIT = "27777777771";
 
     // Non-trivial cents pin exact DECIMAL summation. Each rate constant feeds
@@ -91,6 +119,8 @@ class CertificateConsolidationE2eTest {
     private static final BigDecimal OPEN_PERIOD_AMOUNT = new BigDecimal("17.50");
 
     // Incremental emission (test 2): two waves upserting the same primary key.
+    // Like SNAPSHOT_CUIT, deliberately absent from the seed's merchants, so
+    // its lines must consolidate with SQL NULL merchant columns.
     private static final String INCREMENTAL_CUIT = "27999999993";
     private static final BigDecimal WAVE_1_BASE = new BigDecimal("1000.00");
     private static final BigDecimal WAVE_1_AMOUNT = new BigDecimal("50.00");
@@ -98,6 +128,12 @@ class CertificateConsolidationE2eTest {
     private static final BigDecimal WAVE_2_AMOUNT = new BigDecimal("25.00");
     private static final BigDecimal PER_MID_STREAM_BASE = new BigDecimal("1000.00");
     private static final BigDecimal PER_MID_STREAM_AMOUNT = new BigDecimal("210.00");
+
+    // Watermark-flush rows (see flushWatermarkWithPerception): any PER_* row
+    // works because the taxonomy filter drops it, so its money values can
+    // never reach a certificate line.
+    private static final BigDecimal FLUSH_PER_BASE = new BigDecimal("1000.00");
+    private static final BigDecimal FLUSH_PER_AMOUNT = new BigDecimal("210.00");
 
     @Test
     void consolidatesSnapshotWithholdingsByRateAndFreezesClosedPeriods() throws Exception {
@@ -124,6 +160,25 @@ class CertificateConsolidationE2eTest {
             result = startConsolidationJob(pair);
 
             List<RateLine> expected = expectedSnapshotLines(minuteStart);
+            // The temporal join buffers every calculation until the combined
+            // watermark of both inputs passes its created_at (see TaxJob's
+            // consolidation comment). The merchants input idles ~2s after its
+            // snapshot (its watermark is stuck at epoch 0, so idling is the
+            // only way it stops gating the combined watermark), but the race
+            // between the two inputs' idle flips can freeze the combined
+            // watermark below every buffered row: once BOTH inputs are idle,
+            // the combined watermark never recomputes, and a watermark that
+            // arrived while the merchants input was still active stays stuck
+            // in its input's partial watermark. Two perception flushes close
+            // that hole deterministically: the first, dated ~60s ahead of
+            // now, advances the tax input's watermark immediately; the
+            // second, sent after both inputs have certainly gone idle,
+            // re-activates the tax input and releases its watermark into the
+            // combined one. Perceptions never consolidate (taxonomy filter),
+            // so neither flush can alter any asserted line.
+            flushWatermarkWithPerception(pair, SNAPSHOT_CUIT);
+            Thread.sleep(IDLE_FLIP_SETTLE_MILLIS);
+            flushWatermarkWithPerception(pair, SNAPSHOT_CUIT);
             await().atMost(SNAPSHOT_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
@@ -132,8 +187,7 @@ class CertificateConsolidationE2eTest {
                         // other merchant's lines are in scope here too.
                         assertEquals(0, countPerceptionLines(pair),
                                 "perceptions must never consolidate into certificate_items");
-                        assertEquals(0, countEnrichedLines(pair),
-                                "enrichment is issue #6: no line may carry establishment or merchant_name yet");
+                        assertEnrichedCuitsHaveMasterData(pair);
                     });
 
             List<RateLine> closedPeriodLines = fetchRateLines(pair, SNAPSHOT_CUIT);
@@ -144,6 +198,15 @@ class CertificateConsolidationE2eTest {
             // Closed-period stability: ongoing open-period activity for a
             // different cuit must not disturb the closed lines.
             insertSourceCalculation(pair, OPEN_PERIOD_CUIT, TAX_ID_RET_IVA, IVA_RATE_3_50, OPEN_PERIOD_BASE, OPEN_PERIOD_AMOUNT);
+            // The temporal join only emits a calculation once the combined
+            // watermark of both inputs passes its created_at (see TaxJob's
+            // consolidation comment), so this lone streaming insert would sit
+            // buffered forever: nothing else pushes the watermark past it.
+            // The perception flush below is dated ~60s ahead of everything
+            // already inserted, which advances the watermark past the open
+            // row; perceptions never consolidate, so it cannot alter any
+            // asserted line.
+            flushWatermarkWithPerception(pair, OPEN_PERIOD_CUIT);
             await().atMost(STREAMING_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
@@ -179,10 +242,30 @@ class CertificateConsolidationE2eTest {
         try (PostgresPair pair = PostgresPair.start()) {
             result = startConsolidationJob(pair);
 
+            // The incremental CDC source probes for its streaming resume
+            // position for roughly the first ~12 seconds after job start, and
+            // rows committed inside that window can be skipped when the real
+            // stream starts past them (observed as flaky wave-1 losses). A
+            // sacrificial perception row forces that probe to complete, and
+            // the settle wait keeps every asserted insert below outside the
+            // window; perceptions never consolidate, so the warm-up row is
+            // invisible in certificate_items either way.
+            insertSourceCalculation(pair, INCREMENTAL_CUIT, "PER_IVA", PER_IVA_RATE_21_00,
+                    PER_MID_STREAM_BASE, PER_MID_STREAM_AMOUNT);
+            Thread.sleep(STREAM_ANCHOR_SETTLE_MILLIS);
+
             // Wave 1 goes into the currently open period (created_at defaults
             // to now()); aligned to a fresh minute so wave 2 below has room.
             waitUntilMinuteHeadroom();
             insertSourceCalculation(pair, INCREMENTAL_CUIT, TAX_ID_RET_IVA, IVA_RATE_5_00, WAVE_1_BASE, WAVE_1_AMOUNT);
+            // The temporal join buffers every calculation until the combined
+            // watermark passes its created_at (see TaxJob's consolidation
+            // comment), so wave 1 would never emit on its own: nothing else
+            // is due to arrive before it. The perception flush is dated ~60s
+            // ahead of wave 1, pushing the watermark past both wave 1 and the
+            // mid-period wave 2 pinned below (period_start + 30s); perceptions
+            // never consolidate, so it cannot alter any asserted line.
+            flushWatermarkWithPerception(pair, INCREMENTAL_CUIT);
 
             AtomicReference<OffsetDateTime> periodStartRef = new AtomicReference<>();
             await().atMost(STREAMING_CONVERGENCE)
@@ -212,6 +295,14 @@ class CertificateConsolidationE2eTest {
                     WAVE_2_BASE, WAVE_2_AMOUNT, periodStart.toEpochSecond() + 30);
             insertSourceCalculation(pair, INCREMENTAL_CUIT, "PER_IVA", PER_IVA_RATE_21_00,
                     PER_MID_STREAM_BASE, PER_MID_STREAM_AMOUNT);
+            // Wave 2 is dated below the watermark the flush above already
+            // pushed (its created_at is pinned mid-period), so it is a late
+            // row: the temporal join buffers it and only emits on the next
+            // watermark advance, which a quiet stream never produces. This
+            // second perception flush, dated ~60s ahead of now, provides that
+            // advance; perceptions never consolidate, so it cannot alter any
+            // asserted line.
+            flushWatermarkWithPerception(pair, INCREMENTAL_CUIT);
 
             BigDecimal expectedBase = WAVE_1_BASE.add(WAVE_2_BASE);
             BigDecimal expectedAmount = WAVE_1_AMOUNT.add(WAVE_2_AMOUNT);
@@ -234,8 +325,10 @@ class CertificateConsolidationE2eTest {
                                 "totals must be the exact DECIMAL sum of both waves");
                         assertEquals(1, countPrimaryKeyRows(pair, INCREMENTAL_CUIT, TAX_ID_RET_IVA, periodStart, IVA_RATE_5_00),
                                 "exactly one row may exist for the (cuit, tax_id, window_start, tax_rate) key");
-                        assertNull(line.establishment(), "enrichment is issue #6: establishment must stay SQL NULL");
-                        assertNull(line.merchantName(), "enrichment is issue #6: merchant_name must stay SQL NULL");
+                        assertNull(line.establishment(),
+                                "the CUIT has no merchant row, so enrichment must be SQL NULL");
+                        assertNull(line.merchantName(),
+                                "the CUIT has no merchant row, so enrichment must be SQL NULL");
                     });
         } finally {
             // The job runs until cancelled; stop it before the containers go.
@@ -307,8 +400,10 @@ class CertificateConsolidationE2eTest {
                     "window_end of line " + where);
             assertEquals(actualLine.windowStart().toInstant().plusSeconds(60), actualLine.windowEnd().toInstant(),
                     "window_end must be window_start + 60s for line " + where);
-            assertNull(actualLine.establishment(), "enrichment is issue #6: establishment must stay SQL NULL");
-            assertNull(actualLine.merchantName(), "enrichment is issue #6: merchant_name must stay SQL NULL");
+            assertNull(actualLine.establishment(),
+                    "the CUIT has no merchant row, so enrichment must be SQL NULL");
+            assertNull(actualLine.merchantName(),
+                    "the CUIT has no merchant row, so enrichment must be SQL NULL");
             assertEquals(0, expectedLine.totalBaseTax().compareTo(actualLine.totalBaseTax()),
                     "total_base_tax of line " + where);
             assertEquals(0, expectedLine.totalTaxAmount().compareTo(actualLine.totalTaxAmount()),
@@ -393,11 +488,66 @@ class CertificateConsolidationE2eTest {
                 "Failed to count perception lines");
     }
 
-    /** Enrichment is issue #6: until then not a single line may carry merchant data. */
-    private long countEnrichedLines(PostgresPair pair) {
-        return countTargetRows(pair,
-                "SELECT count(*) FROM certificate_items WHERE establishment IS NOT NULL OR merchant_name IS NOT NULL",
-                "Failed to count enriched lines");
+    /**
+     * Enrichment invariant that holds regardless of how much master data a
+     * run contains (issue #6): a line may only carry merchant data when its
+     * CUIT actually has a merchant row in the SOURCE. CUITs without master
+     * data must consolidate with SQL NULL merchant columns (LEFT join), so an
+     * enriched line outside the source's merchant CUITs would mean the join
+     * fabricated data.
+     */
+    private void assertEnrichedCuitsHaveMasterData(PostgresPair pair) {
+        Set<String> merchantCuits = fetchMerchantCuits(pair);
+        List<String> enrichedCuits = fetchEnrichedCuits(pair);
+        assertTrue(enrichedCuits.stream().allMatch(merchantCuits::contains),
+                () -> "enrichment must only appear for CUITs with a merchant row; merchant CUITs "
+                        + merchantCuits + " but enriched line CUITs " + enrichedCuits);
+    }
+
+    /** CUITs that have a merchant row in the source (master data actually present). */
+    private Set<String> fetchMerchantCuits(PostgresPair pair) {
+        try (Connection connection = pair.openSourceConnection();
+             PreparedStatement statement = connection.prepareStatement("SELECT cuit FROM merchants");
+             ResultSet resultSet = statement.executeQuery()) {
+            Set<String> cuits = new HashSet<>();
+            while (resultSet.next()) {
+                cuits.add(resultSet.getString(1));
+            }
+            return cuits;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read merchant CUITs from the source", e);
+        }
+    }
+
+    /** CUITs of every materialized line that carries any merchant data. */
+    private List<String> fetchEnrichedCuits(PostgresPair pair) {
+        String sql = "SELECT DISTINCT cuit FROM certificate_items "
+                + "WHERE establishment IS NOT NULL OR merchant_name IS NOT NULL";
+        try (Connection connection = pair.openTargetConnection();
+             PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet resultSet = statement.executeQuery()) {
+            List<String> cuits = new ArrayList<>();
+            while (resultSet.next()) {
+                cuits.add(resultSet.getString(1));
+            }
+            return cuits;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read enriched CUITs from certificate_items", e);
+        }
+    }
+
+    /**
+     * Pushes the source watermark past everything already inserted by this
+     * test: the event-time temporal join emits a calculation only once the
+     * combined watermark of both inputs passes its created_at, so a quiet
+     * stream holds its last rows buffered forever (see TaxJob's consolidation
+     * comment). The flush row is a perception dated ~60 seconds ahead of now;
+     * perceptions never consolidate (taxonomy filter), so it can never alter
+     * any asserted line.
+     */
+    private void flushWatermarkWithPerception(PostgresPair pair, String cuit) {
+        insertSourceCalculationAt(pair, cuit, "PER_IVA", PER_IVA_RATE_21_00,
+                FLUSH_PER_BASE, FLUSH_PER_AMOUNT, Instant.now().getEpochSecond() + 60);
     }
 
     private long countPrimaryKeyRows(PostgresPair pair, String cuit, String taxId,
