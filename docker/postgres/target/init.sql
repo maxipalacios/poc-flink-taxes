@@ -1,16 +1,21 @@
 -- Target PostgreSQL initialization for the tax engine PoC.
 --
 -- Creates the schema materialized by the Flink pipeline. Tables start EMPTY
--- and are populated at runtime through JDBC sinks: the domain tables by the
--- certification jobs (issues #4-#9), `tax_calculations_mirror` by the issue
--- #4 CDC tracer-bullet job. There is no REST layer; these tables are the
--- queryable materialized view.
+-- and are populated at runtime through JDBC sinks by the certification jobs
+-- (issues #4-#9). There is no REST layer; these tables are the queryable
+-- materialized view.
 
 -- Naming note: the physical table name `certificate_items` follows the
 -- approved design (issue #1 / issue #3 acceptance criteria). The domain
 -- term for one row is "Rate Line" (GLOSSARY.md lists "certificate item" as
 -- an avoid-term in prose); the physical name is kept deliberately. This
 -- resolves the naming flag raised in issue #2's follow-ups.
+--
+-- The `window_start` / `window_end` columns deliberately reuse Flink's window
+-- vocabulary for the certification-period boundaries: the spec fixes these
+-- physical column names, and the underlying SQL is a windowed aggregation
+-- over tumbling periods. In prose, prefer the domain term "certification
+-- period" (GLOSSARY.md lists "window" as an avoid-term for the concept).
 CREATE TABLE certificate_items (
     cuit             varchar(11)   NOT NULL,
     tax_id           varchar(30)   NOT NULL,
@@ -25,22 +30,14 @@ CREATE TABLE certificate_items (
 );
 
 -- ============================================================================
--- DEBUGGING ARTIFACT: raw mirror of the source `tax_calculations` table,
--- written by the Flink CDC tracer-bullet job (issue #4) to verify the CDC
--- pipeline end to end. It is not part of the domain model, nothing consumes
--- it, and later issues (#5+) do not read it. Column types mirror the source
--- table's physical schema; `id` carries over the source-generated value, so
--- the mirror declares no identity.
+-- Pipeline role (least privilege). The `flink` bootstrap superuser stays the
+-- admin account for healthchecks and manual `psql -U flink` sessions; the
+-- JDBC upsert sink connects as this dedicated role instead (see README,
+-- credentials). The sink emits INSERT .. ON CONFLICT DO UPDATE for every
+-- consolidation result and DELETE on retractions, hence the DML grant set;
+-- SELECT covers read-back verification.
 -- ============================================================================
-CREATE TABLE tax_calculations_mirror (
-    id             bigint PRIMARY KEY,
-    transaction_id uuid,
-    cuit           varchar(11),
-    tax_id         varchar(30),
-    tax_rate       numeric(5,2),
-    base_tax       numeric(18,2),
-    tax_amount     numeric(18,2),
-    tax_status     varchar(10),
-    exclusion_rate numeric(5,2),
-    created_at     timestamptz
-);
+CREATE ROLE flink_sink LOGIN PASSWORD 'flink';
+GRANT CONNECT ON DATABASE taxes TO flink_sink;
+GRANT USAGE ON SCHEMA public TO flink_sink;
+GRANT SELECT, INSERT, UPDATE, DELETE ON certificate_items TO flink_sink;

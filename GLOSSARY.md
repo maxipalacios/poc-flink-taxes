@@ -35,3 +35,4 @@ _Avoid_: ítem de tasa, "certificate item"
 **Certification Period**:
 The time interval during which withholdings consolidate into a certificate. A closed certificate no longer admits withholdings from its period.
 _Avoid_: "window" when referring to the domain concept rather than the mechanism
+_Physical columns_: the target schema stores the period boundaries as `window_start` / `window_end` ([docker/postgres/target/init.sql](docker/postgres/target/init.sql)) — the spec fixes those column names and the underlying SQL is a windowed aggregation; "window" remains an avoid-term in prose.

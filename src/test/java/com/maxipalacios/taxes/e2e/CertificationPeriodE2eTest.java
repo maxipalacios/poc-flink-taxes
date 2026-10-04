@@ -15,7 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
-import com.maxipalacios.taxes.PipelineConfig;
+import com.maxipalacios.taxes.CertificationPeriod;
 import com.maxipalacios.taxes.TaxJob;
 
 import org.apache.flink.core.execution.JobClient;
@@ -28,6 +28,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import static com.maxipalacios.taxes.e2e.E2eFixtures.countTargetRows;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculation;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
 
 /**
  * End-to-end tests for issue #7's parametrized certification periods: each
@@ -64,10 +70,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * empirically).</b> The consolidation WHERE drops every calculation whose
  * created_at is below the source watermark at its arrival, and during the
  * snapshot that watermark is max(created_at delivered so far) - 5 seconds.
- * An id-order delivery assumption (ascending created_at) does NOT hold: a
- * side-by-side mirror run recorded the snapshot's arrival order by heap ctid
- * and caught it scrambled (rows interleaved near-even/odd, varying run to
- * run), so ANY snapshot row older than an already-delivered newer row is
+ * An id-order delivery assumption (ascending created_at) does NOT hold: the
+ * snapshot's arrival order was recorded by heap ctid and caught scrambled
+ * (rows interleaved near-even/odd, varying run to run), so ANY snapshot row
+ * older than an already-delivered newer row is
  * dropped — the seed's own old rows included. The deterministic recipe is
  * therefore: delete the seed's own calculations ({@code DELETE FROM
  * tax_calculations}) and plant exactly the snapshot rows the test asserts
@@ -90,21 +96,11 @@ class CertificationPeriodE2eTest {
      * can be skipped when the stream starts past them — worse, records
      * committed inside it race the snapshot's chunk commit and can
      * permanently drop snapshot rows behind an already-advanced watermark
-     * (diagnosed against a side-by-side mirror run: the mirror delivered
-     * every row the consolidation pipeline lost; waiting this settle out
-     * before the first tick made every run materialize completely). Asserted
-     * inserts start only after this wait.
+     * (empirically diagnosed: waiting this settle out before the first tick
+     * made every run materialize completely). Asserted inserts start only
+     * after this wait.
      */
     private static final long STREAM_ANCHOR_SETTLE_MILLIS = 15_000;
-
-    /**
-     * Real-time gap between the last row under test and the perception tick:
-     * the tick only pushes the combined watermark past the last row's
-     * created_at if it lands more than the 5-second bounded out-of-orderness
-     * later in real time; 6.5 seconds leaves margin for scheduling and JDBC
-     * round trips.
-     */
-    private static final long TICK_GAP_MILLIS = 6_500;
 
     /**
      * Real-time gap long enough that both CDC inputs have certainly flipped
@@ -534,32 +530,11 @@ class CertificationPeriodE2eTest {
      * on checkpoints.
      */
     private TableResult startConsolidationJob(PostgresPair pair, String certificationPeriodSpec) {
-        PipelineConfig cfg = new PipelineConfig(
-                pair.sourceHost(),
-                Integer.toString(pair.sourcePort()),
-                pair.targetHost(),
-                Integer.toString(pair.targetPort()),
-                PostgresPair.DATABASE,
-                PostgresPair.USERNAME,
-                PostgresPair.PASSWORD,
-                pair.slotName(),
-                certificationPeriodSpec);
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
         env.enableCheckpointing(5_000);
-        return TaxJob.consolidateCertificates(cfg, env);
-    }
-
-    /**
-     * Snapshot-row recipe prep (see the class javadoc): removes the seed's
-     * own calculations so the rows a test plants are the ONLY ones the CDC
-     * snapshot carries. The snapshot's delivery order is scrambled (verified
-     * empirically), so any planted row older than an already-delivered newer
-     * row would be dropped by the late-arrival filter; a lone planted row is
-     * immune to any delivery order. Must run BEFORE the job starts.
-     */
-    private void deleteSeedTaxCalculations(PostgresPair pair) {
-        pair.executeSourceStatement("DELETE FROM tax_calculations");
+        return TaxJob.consolidateCertificates(
+                E2eFixtures.pipelineConfig(pair, CertificationPeriod.parse(certificationPeriodSpec)), env);
     }
 
     /** Buenos Aires midnight floor of an instant (the daily period start). */
@@ -599,25 +574,6 @@ class CertificationPeriodE2eTest {
         }
     }
 
-    /** Plain insert whose created_at defaults to now(): the row lands in the currently open period. */
-    private void insertSourceCalculation(PostgresPair pair, String cuit, String taxId,
-            BigDecimal taxRate, BigDecimal baseTax, BigDecimal taxAmount) {
-        pair.executeSourceStatement("""
-                INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate)
-                VALUES ('%s', '%s', %s, %s, %s, 'CL', 0.00)
-                """.formatted(cuit, taxId, taxRate.toPlainString(), baseTax.toPlainString(), taxAmount.toPlainString()));
-    }
-
-    /** Same insert with an explicit event time, so the row lands in a chosen certification period. */
-    private void insertSourceCalculationAt(PostgresPair pair, String cuit, String taxId,
-            BigDecimal taxRate, BigDecimal baseTax, BigDecimal taxAmount, long createdAtEpochSecond) {
-        pair.executeSourceStatement("""
-                INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate, created_at)
-                VALUES ('%s', '%s', %s, %s, %s, 'CL', 0.00, to_timestamp(%d))
-                """.formatted(cuit, taxId, taxRate.toPlainString(), baseTax.toPlainString(),
-                        taxAmount.toPlainString(), createdAtEpochSecond));
-    }
-
     /**
      * Perception tick: a PER_IVA row whose created_at defaults to now(). The
      * taxonomy filter drops PER_* before anything is written, so the tick can
@@ -628,21 +584,6 @@ class CertificationPeriodE2eTest {
     private void insertPerceptionTick(PostgresPair pair) {
         insertSourceCalculation(pair, TICK_CUIT, TAX_ID_PER_IVA, PER_TICK_RATE_21_00,
                 PER_TICK_BASE, PER_TICK_AMOUNT);
-    }
-
-    /**
-     * Real-time gap between the last row under test and the perception tick:
-     * the tick only pushes the combined watermark past the last row's
-     * created_at if it lands more than the 5-second bounded out-of-orderness
-     * later in real time.
-     */
-    private static void waitForWatermarkTickGap() {
-        try {
-            Thread.sleep(TICK_GAP_MILLIS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while waiting for the watermark tick gap", e);
-        }
     }
 
     /** All rate lines of one cuit, in fetch order (tax_id, then tax_rate, then window_start). */
@@ -687,17 +628,6 @@ class CertificationPeriodE2eTest {
     private long countPerceptionLines(PostgresPair pair) {
         return countTargetRows(pair, "SELECT count(*) FROM certificate_items WHERE tax_id LIKE 'PER%'",
                 "Failed to count perception lines");
-    }
-
-    private long countTargetRows(PostgresPair pair, String sql, String failureMessage) {
-        try (Connection connection = pair.openTargetConnection();
-             PreparedStatement statement = connection.prepareStatement(sql);
-             ResultSet resultSet = statement.executeQuery()) {
-            resultSet.next();
-            return resultSet.getLong(1);
-        } catch (SQLException e) {
-            throw new IllegalStateException(failureMessage, e);
-        }
     }
 
     /** One materialized rate line of certificate_items, as read back from the target. */

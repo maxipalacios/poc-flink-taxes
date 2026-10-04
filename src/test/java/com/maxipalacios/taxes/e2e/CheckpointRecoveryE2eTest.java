@@ -13,7 +13,6 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -25,6 +24,8 @@ import java.util.concurrent.TimeoutException;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotModifiedException;
+import com.maxipalacios.taxes.CertificationPeriod;
+import com.maxipalacios.taxes.DbConnection;
 import com.maxipalacios.taxes.PipelineConfig;
 import com.maxipalacios.taxes.TaxJob;
 
@@ -40,6 +41,11 @@ import org.testcontainers.DockerClientFactory;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+
+import static com.maxipalacios.taxes.e2e.E2eFixtures.atEpochSecond;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
 
 /**
  * End-to-end test for issue #8's automated checkpoint-recovery criterion: a
@@ -186,16 +192,6 @@ class CheckpointRecoveryE2eTest {
      * consolidation suite's test 1).
      */
     private static final long IDLE_FLIP_SETTLE_MILLIS = 12_000;
-
-    /**
-     * Real-time gap between the last row under test and the perception tick:
-     * the tick only pushes the combined watermark past the last row's
-     * created_at if it lands more than the 5-second bounded out-of-orderness
-     * later in real time; 6.5 seconds leaves margin for scheduling and JDBC
-     * round trips. The same gap protects rows inserted AFTER a tick: a row
-     * dated its own now() stays above the tick's watermark (tick - 5s).
-     */
-    private static final long TICK_GAP_MILLIS = 6_500;
 
     /**
      * Generous restart budget for the failover: the sink task fails on every
@@ -541,19 +537,16 @@ class CheckpointRecoveryE2eTest {
      */
     private TableResult startConsolidationJob(PostgresPair pair, Path checkpointRoot) {
         PipelineConfig cfg = new PipelineConfig(
-                pair.sourceHost(),
-                Integer.toString(pair.sourcePort()),
+                new DbConnection(pair.sourceHost(), Integer.toString(pair.sourcePort()),
+                        PostgresPair.USERNAME, PostgresPair.PASSWORD, PostgresPair.DATABASE),
                 // Direct container coordinates for the sink (see the class
                 // javadoc's docker-29 finding): the sink's JDBC URL must keep
                 // working across the target's stop/start cycle, which the
                 // mapped host port does not.
-                targetIp,
-                Integer.toString(TARGET_POSTGRES_PORT),
-                PostgresPair.DATABASE,
-                PostgresPair.USERNAME,
-                PostgresPair.PASSWORD,
+                new DbConnection(targetIp, Integer.toString(TARGET_POSTGRES_PORT),
+                        PostgresPair.USERNAME, PostgresPair.PASSWORD, PostgresPair.DATABASE),
                 pair.slotName(),
-                "60s");
+                CertificationPeriod.parse("60s"));
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
         env.enableCheckpointing(TaxJob.CHECKPOINT_INTERVAL_MS);
@@ -696,11 +689,6 @@ class CheckpointRecoveryE2eTest {
                 .toList();
     }
 
-    /** Expected timestamps are instants; the JDBC session offset must not matter. */
-    private static OffsetDateTime atEpochSecond(long epochSecond) {
-        return OffsetDateTime.ofInstant(Instant.ofEpochSecond(epochSecond), ZoneOffset.UTC);
-    }
-
     /**
      * Full-field comparison of the rate lines, in fetch order. Money compares
      * by value (scale must not matter) and timestamps by instant (session
@@ -749,8 +737,10 @@ class CheckpointRecoveryE2eTest {
     }
 
     // ------------------------------------------------------------------
-    // Source/target helpers (self-contained copies of the patterns the
-    // other e2e suites use; the suites deliberately do not share code).
+    // Source/target helpers. The generic fixtures (inserts, seed prep, tick
+    // pacing, timestamp shaping) are shared in E2eFixtures; what stays here
+    // is this suite's own recovery machinery and its global fetch/comparison
+    // helpers, which read ALL of certificate_items instead of one cuit.
     // ------------------------------------------------------------------
 
     /**
@@ -761,11 +751,7 @@ class CheckpointRecoveryE2eTest {
      */
     private MoneyRow insertCalculationAt(PostgresPair pair, String cuit, String taxId,
             BigDecimal taxRate, BigDecimal baseTax, BigDecimal taxAmount, long createdAtEpochSecond) {
-        pair.executeSourceStatement("""
-                INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate, created_at)
-                VALUES ('%s', '%s', %s, %s, %s, 'CL', 0.00, to_timestamp(%d))
-                """.formatted(cuit, taxId, taxRate.toPlainString(), baseTax.toPlainString(),
-                        taxAmount.toPlainString(), createdAtEpochSecond));
+        insertSourceCalculationAt(pair, cuit, taxId, taxRate, baseTax, taxAmount, createdAtEpochSecond);
         return new MoneyRow(taxId, taxRate, createdAtEpochSecond, baseTax, taxAmount);
     }
 
@@ -781,30 +767,6 @@ class CheckpointRecoveryE2eTest {
                 INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate)
                 VALUES ('%s', 'PER_IVA', 21.00, %s, %s, 'CL', 0.00)
                 """.formatted(cuit, PER_TICK_BASE.toPlainString(), PER_TICK_AMOUNT.toPlainString()));
-    }
-
-    /**
-     * Snapshot-row recipe prep (see the class javadoc): removes the seed's
-     * own calculations so the rows this test plants are the ONLY ones the
-     * CDC snapshot carries. Must run BEFORE the job starts.
-     */
-    private void deleteSeedTaxCalculations(PostgresPair pair) {
-        pair.executeSourceStatement("DELETE FROM tax_calculations");
-    }
-
-    /**
-     * Real-time gap between the last row under test and the perception tick:
-     * the tick only pushes the combined watermark past the last row's
-     * created_at if it lands more than the 5-second bounded out-of-orderness
-     * later in real time.
-     */
-    private static void waitForWatermarkTickGap() {
-        try {
-            Thread.sleep(TICK_GAP_MILLIS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while waiting for the watermark tick gap", e);
-        }
     }
 
     /**

@@ -12,8 +12,10 @@ import java.util.regex.Pattern;
  *
  * <ul>
  *     <li>{@code <n>s} — a tumbling period of {@code n} seconds, {@code n >= 1}
- *         integer (e.g. {@code 1s}, {@code 60s}); boundaries are epoch-aligned
- *         (floor of the event's epoch seconds to a multiple of {@code n}).</li>
+ *         integer (e.g. {@code 1s}, {@code 60s}); boundaries align to local
+ *         wall-clock multiples of {@code n} in the job's session time zone
+ *         (America/Argentina/Buenos_Aires), i.e. counted from Buenos Aires
+ *         midnight.</li>
  *     <li>{@code daily} — one calendar day, aligned to midnight of the job's
  *         session time zone (America/Argentina/Buenos_Aires).</li>
  *     <li>{@code monthly} — one calendar month, aligned to the first of the
@@ -29,7 +31,7 @@ public record CertificationPeriod(Kind kind, long seconds, String spec) {
 
     /** Discriminates how a period's boundaries are computed. */
     public enum Kind {
-        /** Fixed n-second tumbling periods, floored on the epoch. */
+        /** Fixed n-second tumbling periods, aligned to local wall-clock multiples of n. */
         SECONDS,
         /** One calendar day: session-time-zone midnight to midnight. */
         CALENDAR_DAY,

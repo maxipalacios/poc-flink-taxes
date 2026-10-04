@@ -52,6 +52,13 @@ public final class PostgresPair implements AutoCloseable {
             // Same flags as the postgres-source service in docker-compose.yml.
             .withCommand("postgres", "-c", "wal_level=logical",
                 "-c", "max_wal_senders=10", "-c", "max_replication_slots=10");
+        // The mounted script is load-bearing beyond the seed data: it also
+        // pre-creates the two CDC publications (dbz_publication for
+        // tax_calculations, flink_tax_merchants_publication for merchants)
+        // that both CDC sources require — PipelineDdl runs them with
+        // publication autocreation DISABLED, because PostgreSQL 17 only lets
+        // superusers or table owners create publications. The script runs as
+        // the bootstrap superuser here, exactly like in docker-compose.
         source.withCopyFileToContainer(
             MountableFile.forHostPath(sourceSeed.toPath()),
             "/docker-entrypoint-initdb.d/001-init.sql");
@@ -82,7 +89,7 @@ public final class PostgresPair implements AutoCloseable {
     // underscores, capped at 63 chars.
     private static String newSlotName() {
         String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        return "flink_tax_mirror_" + suffix;
+        return "flink_tax_poc_" + suffix;
     }
 
     public String sourceHost() {

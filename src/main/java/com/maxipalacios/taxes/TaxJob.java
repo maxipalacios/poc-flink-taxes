@@ -23,10 +23,9 @@ import org.apache.flink.table.api.config.ExecutionConfigOptions;
  * to America/Argentina/Buenos_Aires, and calculations that arrive after the
  * watermark has passed their {@code created_at} are dropped (issue #7).
  *
- * <p>The mirror pipeline ({@link #mirrorTaxCalculations}, issue #4) remains a
- * debugging artifact used to verify the CDC pipeline end to end; it is not a
- * domain table, later issues do not consume it, and it is only exercised by
- * its e2e test.
+ * <p>The connector CREATE TABLE DDL lives in {@link PipelineDdl}, built from
+ * the validated {@link PipelineConfig}; this class orchestrates the pipeline
+ * and generates the consolidation INSERT.
  */
 public final class TaxJob {
 
@@ -93,8 +92,8 @@ public final class TaxJob {
     // being silently ignored, because a mis-typed flag would otherwise run
     // the demo with the wrong period size. Returns null when no flag is
     // present so fromEnv()'s env var keeps deciding. The spec VALUE is
-    // validated later by CertificationPeriod.parse (via the PipelineConfig
-    // constructor). Package-private for the argument-parser unit test.
+    // validated later by CertificationPeriod.parse (via withCertificationPeriod).
+    // Package-private for the argument-parser unit test.
     static String certificationPeriodArg(String[] args) {
         if (args.length == 0) {
             return null;
@@ -164,162 +163,12 @@ public final class TaxJob {
         tables.getConfig().set(
                 ExecutionConfigOptions.TABLE_EXEC_SOURCE_IDLE_TIMEOUT, Duration.ofSeconds(2));
 
-        tables.executeSql(createCdcSourceDdl(cfg, false));
-        tables.executeSql(createMerchantsCdcDdl(cfg));
-        tables.executeSql(createCertificateSinkDdl(cfg));
+        tables.executeSql(PipelineDdl.createCdcSourceDdl(cfg));
+        tables.executeSql(PipelineDdl.createMerchantsCdcDdl(cfg));
+        tables.executeSql(PipelineDdl.createCertificateSinkDdl(cfg));
 
-        return tables.executeSql(createConsolidationInsertSql(
-                CertificationPeriod.parse(cfg.certificationPeriodSpec()), SESSION_ZONE));
-    }
-
-    /**
-     * Builds and submits the mirror pipeline. Public for the e2e tests, which
-     * run it on the local mini-cluster; rejects {@code env} without
-     * checkpointing (see {@link #main}). The returned streaming job runs until
-     * cancelled; {@link TableResult#await()} blocks for it.
-     */
-    public static TableResult mirrorTaxCalculations(PipelineConfig cfg, StreamExecutionEnvironment env) {
-        requireCheckpointing(env, "mirror");
-
-        StreamTableEnvironment tables = StreamTableEnvironment.create(env);
-
-        tables.executeSql(createCdcSourceDdl(cfg, true));
-        tables.executeSql(createMirrorSinkDdl(cfg));
-
-        return tables.executeSql("""
-                INSERT INTO tax_calculations_mirror
-                SELECT id, transaction_id, cuit, tax_id, tax_rate, base_tax, tax_amount,
-                       tax_status, exclusion_rate, CAST(created_at AS TIMESTAMP(6))
-                FROM tax_calculations_cdc
-                """);
-    }
-
-    // Column types mirror the physical schema of the source `tax_calculations`
-    // (docker/postgres/source/init.sql); Postgres timestamptz maps to
-    // TIMESTAMP_LTZ. created_at carries precision 3, the maximum Flink allows
-    // on a watermark's time field (a time field of precision 6 is rejected by
-    // schema validation); source instants are second-granular, so millis
-    // precision loses nothing. NOT ENFORCED because Flink never rechecks the
-    // key. Both pipelines share this DDL: the 5-second bounded-out-of-orderness
-    // watermark is inert for the mirror, but for consolidation it gates
-    // when enriched rows are emitted (see createConsolidationInsertSql) and
-    // drives the late-arrival drop in that pipeline's WHERE (issue #7).
-    //
-    // `declaredPrimaryKey`: the mirror keeps the key because issue #4
-    // declared it that way and its behavior must not change. The
-    // consolidation pipeline passes false: `tax_calculations` is INSERT-only
-    // by domain definition (GLOSSARY, "Tax Calculation": every calculation is
-    // new, an existing one is never corrected), so declaring the source
-    // append-only is semantically exact. It is also load-bearing there:
-    // with the updating (PK-declared) changelog, Flink 1.20.5 silently drops
-    // every row a downstream group aggregation receives from the event-time
-    // temporal join (verified in the e2e run: the join emits, the aggregate
-    // receives, nothing materializes), while with the append-only declaration
-    // the same plan materializes correctly.
-    private static String createCdcSourceDdl(PipelineConfig cfg, boolean declaredPrimaryKey) {
-        String primaryKeyClause = declaredPrimaryKey
-                ? ",\n    PRIMARY KEY (id) NOT ENFORCED"
-                : "";
-        return """
-                CREATE TABLE tax_calculations_cdc (
-                    id             BIGINT,
-                    transaction_id STRING,
-                    cuit           STRING,
-                    tax_id         STRING,
-                    tax_rate       DECIMAL(5, 2),
-                    base_tax       DECIMAL(18, 2),
-                    tax_amount     DECIMAL(18, 2),
-                    tax_status     STRING,
-                    exclusion_rate DECIMAL(5, 2),
-                    created_at     TIMESTAMP_LTZ(3),
-                    WATERMARK FOR created_at AS created_at - INTERVAL '5' SECOND%s
-                ) WITH (
-                    'connector' = 'postgres-cdc',
-                    'hostname' = '%s',
-                    'port' = '%s',
-                    'username' = '%s',
-                    'password' = '%s',
-                    'database-name' = '%s',
-                    'schema-name' = 'public',
-                    'table-name' = 'tax_calculations',
-                    'slot.name' = '%s',
-                    'decoding.plugin.name' = 'pgoutput',
-                    'scan.incremental.snapshot.enabled' = 'true',
-                    'debezium.publication.autocreate.mode' = 'filtered'
-                )
-                """.formatted(
-                        primaryKeyClause,
-                        cfg.sourceHost(),
-                        cfg.sourcePort(),
-                        cfg.username(),
-                        cfg.password(),
-                        cfg.databaseName(),
-                        cfg.replicationSlotName());
-    }
-
-    // DDL for the merchants CDC source (issue #6). `merchants` is a mutable
-    // changelog table (docker/postgres/source/init.sql): inserts and updates
-    // stream as a versioned changelog keyed by CUIT, which is exactly what the
-    // Flink temporal-join docs call a "versioned table" — a PK on the join key
-    // plus a watermarked time attribute. The version time is Debezium's
-    // `source.ts_ms`, exposed by the postgres-cdc connector as the `op_ts`
-    // metadata column (present in flink-sql-connector-postgres-cdc 3.6.0's
-    // PostgreSQLReadableMetadata, TIMESTAMP_LTZ(3)) and declared VIRTUAL
-    // because it is not a physical column of the table. Snapshot records are
-    // stamped with the moment the snapshot read them, so a merchant row
-    // exists as a version only from the job's first snapshot on: calculations
-    // created before that enrich to NULL (as-of finds no version yet), and
-    // anything created after it sees the snapshot version — a calculation
-    // created before a later merchant UPDATE keeps the snapshot version.
-    // The 5-second bounded-out-of-orderness watermark mirrors the
-    // tax_calculations source so the combined watermark advances evenly. A
-    // distinct publication name keeps this source's publication isolated from
-    // the tax_calculations source's default `dbz_publication`: both CDC
-    // sources run against the same database and 'filtered' autocreate mode
-    // must not fight over one publication. NOT ENFORCED because Flink never
-    // rechecks the key.
-    //
-    // Incremental snapshot mode is deliberately DISABLED here: it only makes
-    // snapshot chunks flow after their checkpoint commit, which made the tiny
-    // merchants dimension's delivery race with the tax source's snapshot and
-    // intermittently starve the whole pipeline (observed in the e2e runs).
-    // The table is tiny master data; the legacy consistent snapshot starts
-    // streaming immediately. NOTE for future maintainers: a merchant UPDATE
-    // requires the table to carry REPLICA IDENTITY FULL in the source
-    // database (set in docker/postgres/source/init.sql), otherwise the CDC
-    // message has no before image and the source fails (observed in the e2e
-    // runs).
-    private static String createMerchantsCdcDdl(PipelineConfig cfg) {
-        return """
-                CREATE TABLE merchants_cdc (
-                    cuit          STRING,
-                    name          STRING,
-                    establishment STRING,
-                    op_ts         TIMESTAMP_LTZ(3) METADATA FROM 'op_ts' VIRTUAL,
-                    WATERMARK FOR op_ts AS op_ts - INTERVAL '5' SECOND,
-                    PRIMARY KEY (cuit) NOT ENFORCED
-                ) WITH (
-                    'connector' = 'postgres-cdc',
-                    'hostname' = '%s',
-                    'port' = '%s',
-                    'username' = '%s',
-                    'password' = '%s',
-                    'database-name' = '%s',
-                    'schema-name' = 'public',
-                    'table-name' = 'merchants',
-                    'slot.name' = '%s',
-                    'decoding.plugin.name' = 'pgoutput',
-                    'scan.incremental.snapshot.enabled' = 'false',
-                    'debezium.publication.autocreate.mode' = 'filtered',
-                    'debezium.publication.name' = 'flink_tax_merchants_publication'
-                )
-                """.formatted(
-                        cfg.sourceHost(),
-                        cfg.sourcePort(),
-                        cfg.username(),
-                        cfg.password(),
-                        cfg.databaseName(),
-                        cfg.merchantsReplicationSlotName());
+        // The config carries the parsed period; no re-parse needed here.
+        return tables.executeSql(createConsolidationInsertSql(cfg.certificationPeriod(), SESSION_ZONE));
     }
 
     // Group aggregation fed by an event-time temporal join (issue #6) instead
@@ -350,19 +199,20 @@ public final class TaxJob {
     // the event-time temporal join, and the 5-second bound is pinned by
     // issue #7.
     //
-    // Certification period (issue #7): the size comes from CertificationPeriod
-    // and the window expressions are generated per kind. Fixed n-second
-    // periods floor the event's epoch seconds to a multiple of n;
-    // 'daily'/'monthly' FLOOR the session wall clock TO DAY/TO MONTH, which
-    // aligns them to Buenos Aires midnight / first of month under the session
-    // pin set in consolidateCertificates. The SELECT derives window_start/
-    // window_end from the GROUP BY's period key with scalar functions, the
-    // same way the FLOOR expression used to be repeated. FLOOR is applied
-    // after casting created_at to TIMESTAMP(3) because two 1.20.5 paths are
-    // broken: FLOOR directly on TIMESTAMP_LTZ fails codegen (CompileException)
-    // and UNIX_TIMESTAMP(timestamp_ltz) is rejected by the validator.
-    // 'RET|_%' ESCAPE '|' keeps the underscore literal; it is written 'RET|_%%'
-    // in the template so .formatted() renders the single %.
+    // Certification period (issue #7): the size comes from the parsed
+    // CertificationPeriod and the window expressions are generated per kind.
+    // All kinds align to the session wall clock (issue #1 story #14: period
+    // boundaries are local calendar boundaries): 'daily'/'monthly' FLOOR the
+    // session wall clock TO DAY/TO MONTH, and fixed n-second periods floor
+    // the epoch in local-wall-clock coordinates (see the SECONDS branch). The
+    // SELECT derives window_start/window_end from the GROUP BY's period key
+    // with scalar functions, the same way the FLOOR expression used to be
+    // repeated. FLOOR is applied after casting created_at to TIMESTAMP(3)
+    // because two 1.20.5 paths are broken: FLOOR directly on TIMESTAMP_LTZ
+    // fails codegen (CompileException) and UNIX_TIMESTAMP(timestamp_ltz) is
+    // rejected by the validator. 'RET|_%' ESCAPE '|' keeps the underscore
+    // literal; it is written 'RET|_%%' in the template so .formatted()
+    // renders the single %.
     //
     // Sink conversion (the repo's standing JDBC invariant): the sink DDL
     // declares window_start/window_end as TIMESTAMP(6) (flink-connector-jdbc
@@ -387,22 +237,45 @@ public final class TaxJob {
     // CURRENT_WATERMARK is NULL and nothing can be judged late. The
     // deliberate interaction with the temporal join: a row that arrived ON
     // time and is buffered by the join still emits when the watermark passes
-    // it — the filter removes late arrivals, not buffered rows. The mirror
-    // pipeline keeps mirroring everything, including late rows.
-    private static String createConsolidationInsertSql(CertificationPeriod period, ZoneId zone) {
+    // it — the filter removes late arrivals, not buffered rows.
+    static String createConsolidationInsertSql(CertificationPeriod period, ZoneId zone) {
         String offsetInterval = offsetIntervalLiteral(zone);
         WindowSql sql = switch (period.kind()) {
             case SECONDS -> {
-                // The GROUP BY key is the epoch floor: exact epoch seconds of
-                // the event floored to a multiple of n. UNIX_TIMESTAMP(
-                // DATE_FORMAT(...)) renders the session wall clock (Buenos
-                // Aires by the session pin) without millis, so this truncates
-                // created_at to second granularity — nothing is lost, source
-                // instants are second-granular.
-                String epochFloor =
-                        "CAST(FLOOR(UNIX_TIMESTAMP(DATE_FORMAT(CAST(calc.created_at AS TIMESTAMP(3)), "
-                                + "'yyyy-MM-dd HH:mm:ss')) / " + period.seconds()
-                                + ") * " + period.seconds() + " AS BIGINT)";
+                // The GROUP BY key is the local-wall-clock-aligned epoch
+                // floor. UNIX_TIMESTAMP(DATE_FORMAT(...)) renders the session
+                // wall clock (Buenos Aires by the session pin) without millis
+                // and returns exact epoch seconds — source instants are
+                // second-granular, so nothing is lost. Adding the zone's
+                // fixed offset turns the epoch into the "local pseudo-epoch"
+                // (what the wall clock would read if it were UTC); flooring
+                // THAT to a multiple of n and subtracting the offset again
+                // yields boundary epochs aligned to local wall-clock
+                // multiples of n (local midnight, 00:00:07, ... for a 7s
+                // period), as issue #1 story #14 requires. Buenos Aires holds
+                // a fixed -03:00 forever — offsetIntervalLiteral above
+                // fail-fasts on any zone with a future transition, so the
+                // offset read here is constant for the job's lifetime.
+                //
+                // When n divides the offset's second count (60s, 1s, 2s, ...),
+                // the shift cancels algebraically (FLOOR((x + s)/n) = FLOOR(x/n)
+                // + s/n for integer s/n), so the plain epoch floor of the
+                // pre-alignment formula is emitted unchanged — byte-identical
+                // SQL, identical boundaries for the demo sizes.
+                long offsetSeconds = zone.getRules().getOffset(Instant.now()).getTotalSeconds();
+                String epochSeconds =
+                        "UNIX_TIMESTAMP(DATE_FORMAT(CAST(calc.created_at AS TIMESTAMP(3)), "
+                                + "'yyyy-MM-dd HH:mm:ss'))";
+                String epochFloor;
+                if (offsetSeconds % period.seconds() == 0) {
+                    epochFloor = "CAST(FLOOR(" + epochSeconds
+                            + " / " + period.seconds()
+                            + ") * " + period.seconds() + " AS BIGINT)";
+                } else {
+                    epochFloor = "CAST(FLOOR((" + epochSeconds + signed(offsetSeconds)
+                            + ") / " + period.seconds()
+                            + ") * " + period.seconds() + signed(-offsetSeconds) + " AS BIGINT)";
+                }
                 String windowStart = "CAST(TO_TIMESTAMP_LTZ(" + epochFloor + ", 0) AS TIMESTAMP(6)) - " + offsetInterval;
                 yield new WindowSql(windowStart,
                         windowStart + " + INTERVAL '" + period.seconds() + "' SECOND", epochFloor);
@@ -447,6 +320,12 @@ public final class TaxJob {
                 """.formatted(sql.windowStart(), sql.windowEnd(), sql.groupKey());
     }
 
+    // Renders a second count as a signed arithmetic SQL fragment (" + 10800"
+    // or " - 10800"); zero renders as " + 0", which callers avoid.
+    private static String signed(long seconds) {
+        return seconds < 0 ? " - " + -seconds : " + " + seconds;
+    }
+
     // The three SQL fragments one period kind generates: the window_start and
     // window_end sink expressions and the GROUP BY period key.
     private record WindowSql(String windowStart, String windowEnd, String groupKey) {
@@ -488,83 +367,5 @@ public final class TaxJob {
         int minutes = Math.abs(totalSeconds) % 3600 / 60;
         String sign = totalSeconds < 0 ? "-" : "";
         return "INTERVAL '" + sign + hours + ":" + minutes + "' HOUR TO MINUTE";
-    }
-
-    // Certificate sink DDL: window_start/window_end are declared TIMESTAMP(6)
-    // and cast in the INSERT because the JDBC sink's Postgres dialect
-    // converter (flink-connector-jdbc 3.3.0) has no converter for
-    // TIMESTAMP_LTZ (same finding as the mirror DDL). The INSERT therefore
-    // writes plain TIMESTAMP values, which the JDBC/pgjdbc stack interprets
-    // in the JVM default time zone — UTC in every runtime of this project
-    // (compose containers and test host) — so createConsolidationInsertSql
-    // produces each period boundary as the UTC wall clock (session wall
-    // clock minus the zone's offset interval), and the boundary instants land
-    // exactly in the physical timestamptz columns
-    // (docker/postgres/target/init.sql). No stringtype=unspecified here:
-    // unlike the mirror, there is no uuid column to land. The declared key
-    // matches the physical PRIMARY KEY, so the JDBC sink upserts and replays
-    // converge idempotently.
-    private static String createCertificateSinkDdl(PipelineConfig cfg) {
-        return """
-                CREATE TABLE certificate_items (
-                    cuit             STRING,
-                    tax_id           STRING,
-                    window_start     TIMESTAMP(6),
-                    tax_rate         DECIMAL(5, 2),
-                    establishment    STRING,
-                    merchant_name    STRING,
-                    window_end       TIMESTAMP(6),
-                    total_base_tax   DECIMAL(18, 2),
-                    total_tax_amount DECIMAL(18, 2),
-                    PRIMARY KEY (cuit, tax_id, window_start, tax_rate) NOT ENFORCED
-                ) WITH (
-                    'connector' = 'jdbc',
-                    'url' = 'jdbc:postgresql://%s:%s/%s',
-                    'table-name' = 'certificate_items',
-                    'username' = '%s',
-                    'password' = '%s'
-                )
-                """.formatted(
-                        cfg.targetHost(),
-                        cfg.targetPort(),
-                        cfg.databaseName(),
-                        cfg.username(),
-                        cfg.password());
-    }
-
-    // Mirror DDL: the JDBC sink's Postgres dialect converter (flink-connector-jdbc
-    // 3.3.0) has no converter for TIMESTAMP_LTZ, so created_at is declared as
-    // TIMESTAMP(6) and cast in the INSERT below; written into the physical
-    // timestamptz column of tax_calculations_mirror (docker/postgres/target/
-    // init.sql) the UTC instant is preserved. stringtype=unspecified lets
-    // Postgres infer parameter types from the target columns, which is what
-    // lets the STRING transaction_id land in its uuid column.
-    private static String createMirrorSinkDdl(PipelineConfig cfg) {
-        return """
-                CREATE TABLE tax_calculations_mirror (
-                    id             BIGINT,
-                    transaction_id STRING,
-                    cuit           STRING,
-                    tax_id         STRING,
-                    tax_rate       DECIMAL(5, 2),
-                    base_tax       DECIMAL(18, 2),
-                    tax_amount     DECIMAL(18, 2),
-                    tax_status     STRING,
-                    exclusion_rate DECIMAL(5, 2),
-                    created_at     TIMESTAMP(6),
-                    PRIMARY KEY (id) NOT ENFORCED
-                ) WITH (
-                    'connector' = 'jdbc',
-                    'url' = 'jdbc:postgresql://%s:%s/%s?stringtype=unspecified',
-                    'table-name' = 'tax_calculations_mirror',
-                    'username' = '%s',
-                    'password' = '%s'
-                )
-                """.formatted(
-                        cfg.targetHost(),
-                        cfg.targetPort(),
-                        cfg.databaseName(),
-                        cfg.username(),
-                        cfg.password());
     }
 }

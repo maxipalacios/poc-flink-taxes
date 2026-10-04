@@ -8,7 +8,6 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -16,7 +15,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
-import com.maxipalacios.taxes.PipelineConfig;
+import com.maxipalacios.taxes.CertificationPeriod;
 import com.maxipalacios.taxes.TaxJob;
 
 import org.apache.flink.core.execution.JobClient;
@@ -28,6 +27,13 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import static com.maxipalacios.taxes.e2e.E2eFixtures.atEpochSecond;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.countTargetRows;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculation;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
+import static com.maxipalacios.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
 
 /**
  * End-to-end tests for issue #5 (consolidation) and issue #6 (enrichment):
@@ -79,9 +85,8 @@ class CertificateConsolidationE2eTest {
      * inside that window can be skipped when the stream starts past them —
      * worse, a tick dance committed inside it raced the snapshot's chunk
      * commit and permanently dropped snapshot rows behind an already-advanced
-     * watermark (diagnosed against a side-by-side mirror run: the mirror
-     * delivered every row the consolidation pipeline lost; waiting this settle
-     * out before the first tick made every run materialize completely).
+     * watermark (empirically diagnosed: waiting this settle out before the
+     * first tick made every run materialize completely).
      * Asserted inserts start only after this wait.
      */
     private static final long STREAM_ANCHOR_SETTLE_MILLIS = 15_000;
@@ -95,16 +100,6 @@ class CertificateConsolidationE2eTest {
      * out ticks, it does not gate when asserted rows are inserted.
      */
     private static final long IDLE_FLIP_SETTLE_MILLIS = 12_000;
-
-    /**
-     * Real-time gap between the last row under test and the perception tick:
-     * the tick only pushes the combined watermark past the last row's
-     * created_at if it lands more than the 5-second bounded out-of-orderness
-     * later in real time; 6.5 seconds leaves margin for scheduling and JDBC
-     * round trips. The same gap also protects the rows inserted AFTER a tick:
-     * a row dated its own now() stays above the tick's watermark (tick - 5s).
-     */
-    private static final long TICK_GAP_MILLIS = 6_500;
 
     /**
      * Wave 1 (test 2) must land early enough in its minute for wave 2 (dated
@@ -408,20 +403,10 @@ class CertificateConsolidationE2eTest {
      * snapshot chunks only commit on checkpoints.
      */
     private TableResult startConsolidationJob(PostgresPair pair) {
-        PipelineConfig cfg = new PipelineConfig(
-                pair.sourceHost(),
-                Integer.toString(pair.sourcePort()),
-                pair.targetHost(),
-                Integer.toString(pair.targetPort()),
-                PostgresPair.DATABASE,
-                PostgresPair.USERNAME,
-                PostgresPair.PASSWORD,
-                pair.slotName(),
-                "60s");
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
         env.enableCheckpointing(5_000);
-        return TaxJob.consolidateCertificates(cfg, env);
+        return TaxJob.consolidateCertificates(E2eFixtures.pipelineConfig(pair, CertificationPeriod.parse("60s")), env);
     }
 
     /** Expected rate lines for the snapshot cuit, in the fetch order (tax_id, then tax_rate). */
@@ -435,11 +420,6 @@ class CertificateConsolidationE2eTest {
                         IVA_35_BASE_1.add(IVA_35_BASE_2), IVA_35_AMOUNT_1.add(IVA_35_AMOUNT_2)),
                 new RateLine(SNAPSHOT_CUIT, TAX_ID_RET_IVA, windowStart, windowEnd, IVA_RATE_5_00, null, null,
                         IVA_50_BASE, IVA_50_AMOUNT));
-    }
-
-    /** Expected timestamps are instants; the JDBC session offset must not matter. */
-    private static OffsetDateTime atEpochSecond(long epochSecond) {
-        return OffsetDateTime.ofInstant(Instant.ofEpochSecond(epochSecond), ZoneOffset.UTC);
     }
 
     /**
@@ -490,38 +470,6 @@ class CertificateConsolidationE2eTest {
                         + " amount=" + line.totalTaxAmount().toPlainString()
                         + " window=[" + line.windowStart() + ", " + line.windowEnd() + ")")
                 .collect(Collectors.joining("; "));
-    }
-
-    /** Plain insert whose created_at defaults to now(): the row lands in the currently open period. */
-    private void insertSourceCalculation(PostgresPair pair, String cuit, String taxId,
-            BigDecimal taxRate, BigDecimal baseTax, BigDecimal taxAmount) {
-        pair.executeSourceStatement("""
-                INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate)
-                VALUES ('%s', '%s', %s, %s, %s, 'CL', 0.00)
-                """.formatted(cuit, taxId, taxRate.toPlainString(), baseTax.toPlainString(), taxAmount.toPlainString()));
-    }
-
-    /** Same insert with an explicit event time, so the row lands in a chosen certification period. */
-    private void insertSourceCalculationAt(PostgresPair pair, String cuit, String taxId,
-            BigDecimal taxRate, BigDecimal baseTax, BigDecimal taxAmount, long createdAtEpochSecond) {
-        pair.executeSourceStatement("""
-                INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate, created_at)
-                VALUES ('%s', '%s', %s, %s, %s, 'CL', 0.00, to_timestamp(%d))
-                """.formatted(cuit, taxId, taxRate.toPlainString(), baseTax.toPlainString(),
-                        taxAmount.toPlainString(), createdAtEpochSecond));
-    }
-
-    /**
-     * Snapshot-row recipe prep (see the class javadoc): removes the seed's
-     * own calculations so the rows a test plants are the ONLY ones the CDC
-     * snapshot carries. The snapshot's delivery order is scrambled (verified
-     * empirically), so any planted row older than an already-delivered newer
-     * row would be dropped by the late-arrival filter; with the seed gone
-     * and the planted rows sharing one five-second band, every delivery order
-     * keeps them. Must run BEFORE the job starts.
-     */
-    private void deleteSeedTaxCalculations(PostgresPair pair) {
-        pair.executeSourceStatement("DELETE FROM tax_calculations");
     }
 
     private List<RateLine> fetchRateLines(PostgresPair pair, String cuit) {
@@ -632,21 +580,6 @@ class CertificateConsolidationE2eTest {
                 PER_TICK_BASE, PER_TICK_AMOUNT);
     }
 
-    /**
-     * Real-time gap between the last row under test and the perception tick:
-     * the tick only pushes the combined watermark past the last row's
-     * created_at if it lands more than the 5-second bounded out-of-orderness
-     * later in real time.
-     */
-    private static void waitForWatermarkTickGap() {
-        try {
-            Thread.sleep(TICK_GAP_MILLIS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while waiting for the watermark tick gap", e);
-        }
-    }
-
     private long countPrimaryKeyRows(PostgresPair pair, String cuit, String taxId,
             OffsetDateTime windowStart, BigDecimal taxRate) {
         String sql = "SELECT count(*) FROM certificate_items "
@@ -663,17 +596,6 @@ class CertificateConsolidationE2eTest {
             }
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to count rows for primary key " + cuit + "/" + taxId, e);
-        }
-    }
-
-    private long countTargetRows(PostgresPair pair, String sql, String failureMessage) {
-        try (Connection connection = pair.openTargetConnection();
-             PreparedStatement statement = connection.prepareStatement(sql);
-             ResultSet resultSet = statement.executeQuery()) {
-            resultSet.next();
-            return resultSet.getLong(1);
-        } catch (SQLException e) {
-            throw new IllegalStateException(failureMessage, e);
         }
     }
 

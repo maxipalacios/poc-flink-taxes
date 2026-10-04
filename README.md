@@ -1,6 +1,6 @@
 # poc-flink-taxes
 
-An Apache Flink 1.20.5 proof of concept for learning Change Data Capture: **PostgreSQL CDC in, Flink SQL consolidation, idempotent JDBC upsert out.** No Kafka anywhere — the transport is the source database's logical replication WAL (see [ADR-0001](docs/adr/0001-postgres-cdc-como-transporte-sin-kafka.md)).
+An Apache Flink 1.20.5 proof of concept for learning Change Data Capture: **PostgreSQL CDC in, Flink SQL consolidation, idempotent JDBC upsert out.** No Kafka anywhere — the transport is the source database's logical replication WAL (see [ADR-0001](docs/adr/0001-postgres-cdc-as-transport-without-kafka.md)).
 
 The demo shows the full loop: seed data → manual inserts → certificates **growing live in plain SQL** → a certification period closing → querying closed certificates. All you need is `docker compose` and `psql`.
 
@@ -34,9 +34,6 @@ The demo shows the full loop: seed data → manual inserts → certificates **gr
               postgres-target (PostgreSQL 17)
               certificate_items
               PRIMARY KEY (cuit, tax_id, window_start, tax_rate)
-
-   Side path (debugging artifact, NOT run by the default demo):
-   tax_calculations -> CDC -> JDBC append -> tax_calculations_mirror
 ```
 
 Key mechanics (the `why` lives in the [TaxJob javadoc](src/main/java/com/maxipalacios/taxes/TaxJob.java)):
@@ -67,7 +64,7 @@ docker compose up -d
 | `postgres-source` | source DB, `wal_level=logical` | 5432 |
 | `postgres-target` | target DB, materialized result | 5433 |
 
-> **Host port note.** If another service on your machine already holds port 5432, `docker compose up` fails to start `postgres-source` with a `port is already allocated` bind error. Stop the conflicting service or remove the host mapping — the demo does not need it: every database access below goes through `docker compose exec ... psql`, which works from host and devcontainer regardless of host port bindings (see the note in the [runbook](docs/savepoint-restore-exercise.md)).
+> **Host port note.** All published ports bind to loopback only (`127.0.0.1`) — the Flink REST/UI allows JAR upload and the databases should not be reachable from the network; `curl localhost:8081` and host-side `psql` still work. If another service on your machine already holds port 5432, `docker compose up` fails to start `postgres-source` with a `port is already allocated` bind error. Stop the conflicting service or remove the host mapping — the demo does not need it: every database access below goes through `docker compose exec ... psql`, which works from host and devcontainer regardless of host port bindings (see the note in the [runbook](docs/savepoint-restore-exercise.md)).
 
 ## Demo walkthrough
 
@@ -94,7 +91,6 @@ The source starts with 5 merchants and 24 tax calculations (a backfill spanning 
 docker compose exec postgres-source psql -U flink -d taxes -c 'SELECT count(*) FROM merchants;'             # 5
 docker compose exec postgres-source psql -U flink -d taxes -c 'SELECT count(*) FROM tax_calculations;'      # 24
 docker compose exec postgres-target psql -U flink -d taxes -c 'SELECT count(*) FROM certificate_items;'     # 0
-docker compose exec postgres-target psql -U flink -d taxes -c 'SELECT count(*) FROM tax_calculations_mirror;' # 0
 ```
 
 ### 3. Build the fat JAR
@@ -202,14 +198,6 @@ You will see your two demo rate lines among the closed rows (plus whatever the b
 - **The newest period always stays open** until the next insert — that is the flusher pattern, inherent to event time, not a bug.
 - **`PER_*` perceptions never consolidate** (by design; only the `RET_*` withholding family does).
 
-## The raw CDC mirror as a debugging artifact
-
-`postgres-target` also holds `tax_calculations_mirror`: a raw mirror of the source `tax_calculations` table ([docker/postgres/target/init.sql](docker/postgres/target/init.sql)). It is a **tracer bullet** written by the separate mirror pipeline (`TaxJob.mirrorTaxCalculations`, issue #4) to prove the CDC transport end to end before any domain logic existed.
-
-- Nothing consumes it and it is not part of the domain model; it is exercised only by its e2e test (`TaxCalculationsMirrorE2eTest`).
-- It stays **empty in the default demo**: `main()` runs only the consolidation pipeline.
-- See the [TaxJob javadoc](src/main/java/com/maxipalacios/taxes/TaxJob.java) for why it exists and what it proves.
-
 ## Configuration
 
 ### Certification period
@@ -226,6 +214,15 @@ Example submission for daily certificates:
 docker compose exec jobmanager flink run -c com.maxipalacios.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar --certification-period daily
 ```
 
+### Database credentials
+
+Two sets of credentials exist, both with password `flink` against database `taxes`:
+
+- **Admin/bootstrap** — user `flink`, the compose `POSTGRES_USER` superuser. It serves the container healthchecks and every `docker compose exec ... psql -U flink ...` example in this README (ops and verification access).
+- **Pipeline roles** — the job authenticates as `flink_cdc` on the source (REPLICATION + SELECT; see [docker/postgres/source/init.sql](docker/postgres/source/init.sql)) and as `flink_sink` on the target (SELECT/INSERT/UPDATE/DELETE on `certificate_items`; see [docker/postgres/target/init.sql](docker/postgres/target/init.sql)). The CDC publications on the source are pre-created by the admin role in the init script, because PostgreSQL gates publication management on superuser/table ownership.
+
+Both roles are created by the init scripts, which run only when the data directory is empty. On an already-initialized volume, run `docker compose down -v && docker compose up -d` once so the roles exist.
+
 ### Environment variables
 
 All resolved in [PipelineConfig](src/main/java/com/maxipalacios/taxes/PipelineConfig.java); the defaults fit the compose cluster, so a plain `flink run` needs none of them:
@@ -234,7 +231,8 @@ All resolved in [PipelineConfig](src/main/java/com/maxipalacios/taxes/PipelineCo
 | --- | --- | --- |
 | `SOURCE_POSTGRES_HOST` / `SOURCE_POSTGRES_PORT` | `postgres-source` / `5432` | source connection |
 | `TARGET_POSTGRES_HOST` / `TARGET_POSTGRES_PORT` | `postgres-target` / `5432` | target connection (in-network port; `5433` is only the host mapping) |
-| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `taxes` / `flink` / `flink` | database credentials |
+| `SOURCE_POSTGRES_USER` / `TARGET_POSTGRES_USER` | `flink_cdc` / `flink_sink` | pipeline DB roles (least privilege; see the credentials note above) |
+| `POSTGRES_DB` / `POSTGRES_PASSWORD` | `taxes` / `flink` | database name and password shared by both connections |
 | `CDC_SLOT_NAME` | `flink_tax_certificates` | tax source slot; the merchants slot is derived as `<name>_merchants` |
 | `CERTIFICATION_PERIOD` | `60s` | period spec (same forms as the flag) |
 
@@ -250,20 +248,21 @@ All resolved in [PipelineConfig](src/main/java/com/maxipalacios/taxes/PipelineCo
 docker compose run --rm test-runner bash -lc 'cd /workspace && gradle --no-daemon test'
 ```
 
-`test-runner` uses host networking plus the mounted Docker socket; the e2e tests spin up their own ephemeral PostgreSQL containers via Testcontainers. Unit tests cover the period-spec parser (`CertificationPeriodTest`) and the submission-flag grammar (`TaxJobTest`). The five e2e suites:
+`test-runner` uses host networking plus the mounted Docker socket; the e2e tests spin up their own ephemeral PostgreSQL containers via Testcontainers. Unit tests cover the period-spec parser (`CertificationPeriodTest`) and the submission-flag grammar (`TaxJobTest`). The six e2e suites:
 
 | Suite | Proves |
 | --- | --- |
-| `TaxCalculationsMirrorE2eTest` | the CDC transport end to end (raw mirror) |
 | `CertificateConsolidationE2eTest` | withholdings consolidate into rate lines correctly |
 | `MerchantEnrichmentE2eTest` | the event-time temporal join enriches (and survives merchantless CUITs) |
+| `MerchantDeleteE2eTest` | a merchant deleted after a period closes never rewrites the closed certificate |
 | `CertificationPeriodE2eTest` | period sizing, timezone alignment, and late-row dropping |
 | `CheckpointRecoveryE2eTest` | failover from checkpoints converges without duplicates or gaps |
+| `RestartFromScratchE2eTest` | a fresh job on a new slot re-snapshots and converges to exactly the same certificate rows |
 
 ## Repository map
 
 - [GLOSSARY.md](GLOSSARY.md) — domain vocabulary (merchant, withholding, rate line, certification period).
-- [docs/adr/0001-postgres-cdc-como-transporte-sin-kafka.md](docs/adr/0001-postgres-cdc-como-transporte-sin-kafka.md) — why no Kafka.
+- [docs/adr/0001-postgres-cdc-as-transport-without-kafka.md](docs/adr/0001-postgres-cdc-as-transport-without-kafka.md) — why no Kafka.
 - [docs/savepoint-restore-exercise.md](docs/savepoint-restore-exercise.md) — verified savepoint/stop/restore runbook.
 - [sql/source.sql](sql/source.sql) — helper queries for the source DB (e.g. inspecting replication slots).
 - [src/main/java/com/maxipalacios/taxes/TaxJob.java](src/main/java/com/maxipalacios/taxes/TaxJob.java) — the whole pipeline as Flink SQL; javadoc carries the why.
