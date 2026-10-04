@@ -10,8 +10,12 @@ RUN rm -f /etc/apt/sources.list.d/yarn.list \
     && rm -rf /var/lib/apt/lists/*
 
 # Install a pinned Gradle so plain docker-compose workflows can build the job.
+# The download is verified against the checksum published by services.gradle.org
+# for this exact archive (gradle-${GRADLE_VERSION}-bin.zip.sha256).
 ARG GRADLE_VERSION=8.14.3
+ARG GRADLE_SHA256=bd71102213493060956ec229d946beee57158dbd89d0e62b91bca0fa2c5f3531
 RUN curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip \
+    && echo "${GRADLE_SHA256}  /tmp/gradle.zip" | sha256sum -c - \
     && unzip -q /tmp/gradle.zip -d /opt \
     && ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
     && rm /tmp/gradle.zip

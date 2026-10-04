@@ -41,8 +41,17 @@ services:
   jobmanager:
     image: flink:1.20.5-java17
     command: jobmanager
+    # Host ports bind to loopback only: the Flink REST/UI allows JAR upload
+    # (an RCE surface) and must not listen on every interface. The devcontainer
+    # reaches the services through the compose `flink` network, so nothing
+    # needs a LAN-reachable binding.
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
+    # PoC guard rails, not production sizing: keep a runaway container from
+    # starving the host. `dev`/`test-runner` stay unlimited on purpose (Gradle
+    # builds and Testcontainers need headroom).
+    mem_limit: 2g
+    pids_limit: 512
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
@@ -58,6 +67,9 @@ services:
     command: taskmanager
     depends_on:
       - jobmanager
+    # Same PoC guard rails; the default taskmanager process size is 1728m.
+    mem_limit: 2g
+    pids_limit: 512
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
@@ -83,7 +95,10 @@ services:
       POSTGRES_USER: flink
       POSTGRES_PASSWORD: flink
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    # PoC guard rails, not production sizing.
+    mem_limit: 512m
+    pids_limit: 256
     volumes:
       - postgres-source-data:/var/lib/postgresql/data
       - ./docker/postgres/source/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
@@ -102,7 +117,10 @@ services:
       POSTGRES_USER: flink
       POSTGRES_PASSWORD: flink
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
+    # PoC guard rails, not production sizing.
+    mem_limit: 512m
+    pids_limit: 256
     volumes:
       - postgres-target-data:/var/lib/postgresql/data
       - ./docker/postgres/target/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro

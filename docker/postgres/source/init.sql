@@ -106,3 +106,33 @@ CROSS JOIN (VALUES
 ) AS v(cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, exclusion_rate, created_at);
 
 COMMIT;
+
+-- ============================================================================
+-- Pipeline role (least privilege). The `flink` bootstrap superuser stays the
+-- admin account for healthchecks and manual `psql -U flink` sessions; the CDC
+-- pipeline connects as this dedicated role instead (see README, credentials).
+-- Grants, one per pipeline need:
+--   REPLICATION  consume the logical replication slots (WAL streaming)
+--   CREATE       create publications as a non-superuser — pgoutput needs a
+--                publication per CDC source. Note PostgreSQL 17 gates
+--                publication management on superuser or table ownership
+--                (`FOR ALL TABLES` requires superuser; adding a table to a
+--                publication requires owning it — probe-verified), which
+--                flink_cdc deliberately lacks; the publications are therefore
+--                pre-created by the admin below and the connector must run
+--                with publication autocreation disabled.
+--   SELECT       read all tables during the initial snapshot scan
+-- ============================================================================
+CREATE ROLE flink_cdc LOGIN PASSWORD 'flink' REPLICATION;
+GRANT CONNECT ON DATABASE taxes TO flink_cdc;
+GRANT CREATE ON DATABASE taxes TO flink_cdc;
+GRANT USAGE ON SCHEMA public TO flink_cdc;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO flink_cdc;
+
+-- Publications pre-created by the admin role for the two CDC sources (the
+-- tax_calculations source uses Debezium's default publication name, the
+-- merchants source a distinct one so the two never fight over a publication).
+-- flink_cdc only ever READS these; creating or altering them stays with the
+-- admin, per the ownership gates noted above.
+CREATE PUBLICATION dbz_publication FOR TABLE tax_calculations;
+CREATE PUBLICATION flink_tax_merchants_publication FOR TABLE merchants;
