@@ -4,7 +4,7 @@ plugins {
     id 'com.gradleup.shadow' version '8.3.9'
 }
 
-group = 'com.maxipalacios'
+group = 'com.example'
 version = '0.1.0'
 
 repositories {
@@ -52,7 +52,7 @@ java {
 }
 
 application {
-    mainClass = 'com.maxipalacios.taxes.TaxJob'
+    mainClass = 'com.example.taxes.TaxJob'
 }
 
 // Flink discovers table factories via META-INF/services and several connector

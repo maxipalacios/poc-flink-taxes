@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes;
+package com.example.taxes;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;

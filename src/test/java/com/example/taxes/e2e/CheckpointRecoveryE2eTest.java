@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes.e2e;
+package com.example.taxes.e2e;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -24,10 +24,10 @@ import java.util.concurrent.TimeoutException;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotModifiedException;
-import com.maxipalacios.taxes.CertificationPeriod;
-import com.maxipalacios.taxes.DbConnection;
-import com.maxipalacios.taxes.PipelineConfig;
-import com.maxipalacios.taxes.TaxJob;
+import com.example.taxes.CertificationPeriod;
+import com.example.taxes.DbConnection;
+import com.example.taxes.PipelineConfig;
+import com.example.taxes.TaxJob;
 
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
@@ -42,10 +42,10 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
-import static com.maxipalacios.taxes.e2e.E2eFixtures.atEpochSecond;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
+import static com.example.taxes.e2e.E2eFixtures.atEpochSecond;
+import static com.example.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
+import static com.example.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
 
 /**
  * End-to-end test for issue #8's automated checkpoint-recovery criterion: a

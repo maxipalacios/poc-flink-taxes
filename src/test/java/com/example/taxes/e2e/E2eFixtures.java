@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes.e2e;
+package com.example.taxes.e2e;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
@@ -9,9 +9,9 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 
-import com.maxipalacios.taxes.CertificationPeriod;
-import com.maxipalacios.taxes.DbConnection;
-import com.maxipalacios.taxes.PipelineConfig;
+import com.example.taxes.CertificationPeriod;
+import com.example.taxes.DbConnection;
+import com.example.taxes.PipelineConfig;
 
 /**
  * Shared fixtures for the e2e suites: the source inserts and prep statements

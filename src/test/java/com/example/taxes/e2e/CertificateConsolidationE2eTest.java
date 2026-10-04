@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes.e2e;
+package com.example.taxes.e2e;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
@@ -15,8 +15,8 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
-import com.maxipalacios.taxes.CertificationPeriod;
-import com.maxipalacios.taxes.TaxJob;
+import com.example.taxes.CertificationPeriod;
+import com.example.taxes.TaxJob;
 
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -28,12 +28,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import static com.maxipalacios.taxes.e2e.E2eFixtures.atEpochSecond;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.countTargetRows;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculation;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
+import static com.example.taxes.e2e.E2eFixtures.atEpochSecond;
+import static com.example.taxes.e2e.E2eFixtures.countTargetRows;
+import static com.example.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculation;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
+import static com.example.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
 
 /**
  * End-to-end tests for issue #5 (consolidation) and issue #6 (enrichment):

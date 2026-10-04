@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes.e2e;
+package com.example.taxes.e2e;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
@@ -13,8 +13,8 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
-import com.maxipalacios.taxes.CertificationPeriod;
-import com.maxipalacios.taxes.TaxJob;
+import com.example.taxes.CertificationPeriod;
+import com.example.taxes.TaxJob;
 
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -26,11 +26,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import static com.maxipalacios.taxes.e2e.E2eFixtures.atEpochSecond;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.countTargetRows;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculation;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
+import static com.example.taxes.e2e.E2eFixtures.atEpochSecond;
+import static com.example.taxes.e2e.E2eFixtures.countTargetRows;
+import static com.example.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculation;
+import static com.example.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
 
 /**
  * End-to-end test for a merchant that disappears (spec stories #3 and #11):
@@ -114,9 +114,9 @@ class MerchantDeleteE2eTest {
     // Seeded merchant (docker/postgres/source/init.sql); the cuit is pinned
     // to the seed so the merchant row provably exists before the job's first
     // snapshot and its DELETE removes a real master-data row.
-    private static final String CARREFOUR_CUIT = "30584620389";
-    private static final String CARREFOUR_UPDATED_NAME = "Carrefour Express";
-    private static final String CARREFOUR_UPDATED_ESTABLISHMENT = "10999";
+    private static final String ANDINO_CUIT = "33123456780";
+    private static final String ANDINO_UPDATED_NAME = "Comercio Andino Express";
+    private static final String ANDINO_UPDATED_ESTABLISHMENT = "10999";
 
     // The perception ticks' cuit: absent from merchants, and PER_* rows are
     // dropped by the taxonomy filter before anything is written anyway.
@@ -145,7 +145,7 @@ class MerchantDeleteE2eTest {
 
             // Snapshot-row recipe prep (see E2eFixtures.deleteSeedTaxCalculations):
             // this test plants no snapshot rows of its own, but the seed's
-            // calculations must go so the only Carrefour lines in
+            // calculations must go so the only Comercio Andino lines in
             // certificate_items are the ones this test asserts on.
             deleteSeedTaxCalculations(pair);
 
@@ -166,12 +166,12 @@ class MerchantDeleteE2eTest {
             // The mid-period merchant change: streams into the pipeline as a
             // -U/+U pair; the versioned state keeps the new version under the
             // update's op_ts.
-            updateMerchant(pair, CARREFOUR_CUIT, CARREFOUR_UPDATED_NAME, CARREFOUR_UPDATED_ESTABLISHMENT);
+            updateMerchant(pair, ANDINO_CUIT, ANDINO_UPDATED_NAME, ANDINO_UPDATED_ESTABLISHMENT);
 
             // The withholding, created_at defaults to now(): strictly after
             // the update's commit (so its as-of version is the new one) and
             // inside the same open period thanks to the headroom guard.
-            insertSourceCalculation(pair, CARREFOUR_CUIT, TAX_ID_RET_IVA, UPDATED_RATE_6_75,
+            insertSourceCalculation(pair, ANDINO_CUIT, TAX_ID_RET_IVA, UPDATED_RATE_6_75,
                     UPDATED_BASE, UPDATED_AMOUNT);
 
             waitForWatermarkTickGap();
@@ -182,7 +182,7 @@ class MerchantDeleteE2eTest {
             await().atMost(STREAMING_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
-                        List<RateLine> lines = fetchRateLines(pair, CARREFOUR_CUIT);
+                        List<RateLine> lines = fetchRateLines(pair, ANDINO_CUIT);
                         List<RateLine> updatedLines = linesFor(lines, TAX_ID_RET_IVA, UPDATED_RATE_6_75,
                                 periodStartTime);
                         assertEquals(1, lines.size(),
@@ -194,9 +194,9 @@ class MerchantDeleteE2eTest {
                                 "window_end must be window_start + 60s");
                         // The update must consolidate with the new values,
                         // not the seed ones the merchant had at snapshot time.
-                        assertEquals(CARREFOUR_UPDATED_ESTABLISHMENT, line.establishment(),
+                        assertEquals(ANDINO_UPDATED_ESTABLISHMENT, line.establishment(),
                                 "establishment must be the merchant state as of the withholding's created_at");
-                        assertEquals(CARREFOUR_UPDATED_NAME, line.merchantName(),
+                        assertEquals(ANDINO_UPDATED_NAME, line.merchantName(),
                                 "merchant_name must be the merchant state as of the withholding's created_at");
                         assertEquals(0, UPDATED_BASE.compareTo(line.totalBaseTax()),
                                 "the line must hold its exact single-row totals");
@@ -211,7 +211,7 @@ class MerchantDeleteE2eTest {
             // periodStart + 60 and real time passing it closes the period
             // (window_end in the past) without any further inserts. ----
             waitUntilEpochSecondHasPassed(periodStart + 60);
-            RateLine closedNow = linesFor(fetchRateLines(pair, CARREFOUR_CUIT),
+            RateLine closedNow = linesFor(fetchRateLines(pair, ANDINO_CUIT),
                     TAX_ID_RET_IVA, UPDATED_RATE_6_75, periodStartTime).get(0);
             assertTrue(closedNow.windowEnd().isBefore(OffsetDateTime.now()),
                     "the certification period must be closed (window_end in the past) after the boundary");
@@ -219,8 +219,8 @@ class MerchantDeleteE2eTest {
             // ---- Part B: the merchant DELETE. merchants is a versioned
             // changelog with REPLICA IDENTITY FULL, so the delete streams as
             // a CDC record with the complete before image. ----
-            deleteMerchant(pair, CARREFOUR_CUIT);
-            assertMerchantIsGoneFromSource(pair, CARREFOUR_CUIT);
+            deleteMerchant(pair, ANDINO_CUIT);
+            assertMerchantIsGoneFromSource(pair, ANDINO_CUIT);
 
             // New open-period withholding for the same cuit AFTER the delete:
             // fresh-minute headroom so created_at = now() cannot straddle a
@@ -228,7 +228,7 @@ class MerchantDeleteE2eTest {
             // same period.
             waitUntilMinuteHeadroom(MINUTE_HEADROOM_SECONDS);
             long postDeletePeriodStart = Instant.now().getEpochSecond() / 60 * 60;
-            insertSourceCalculation(pair, CARREFOUR_CUIT, TAX_ID_RET_IVA, POST_DELETE_RATE_2_50,
+            insertSourceCalculation(pair, ANDINO_CUIT, TAX_ID_RET_IVA, POST_DELETE_RATE_2_50,
                     POST_DELETE_BASE, POST_DELETE_AMOUNT);
 
             waitForWatermarkTickGap();
@@ -238,7 +238,7 @@ class MerchantDeleteE2eTest {
             await().atMost(STREAMING_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
-                        List<RateLine> all = fetchRateLines(pair, CARREFOUR_CUIT);
+                        List<RateLine> all = fetchRateLines(pair, ANDINO_CUIT);
                         List<RateLine> closedLines = linesFor(all, TAX_ID_RET_IVA, UPDATED_RATE_6_75,
                                 periodStartTime);
                         List<RateLine> postDeleteLines = linesFor(all, TAX_ID_RET_IVA, POST_DELETE_RATE_2_50,

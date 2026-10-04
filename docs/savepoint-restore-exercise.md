@@ -64,7 +64,7 @@ this document.
 
 ```bash
 docker compose exec jobmanager \
-  flink run -c com.maxipalacios.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar
+  flink run -c com.example.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar
 ```
 
 The job resolves its PostgreSQL coordinates from environment variables; the defaults
@@ -113,15 +113,15 @@ Observed counts while the job ran (checkpoint interval is 10 s):
 ### 3. Insert clearly-labeled streaming rows
 
 To make the demo deterministic, insert a few rows **after** the job is already streaming.
-Use distinctive amounts you can grep later. `30692138747` is a CUIT with merchant master
-data (Farmacity S.A.), so the rows also exercise the temporal join:
+Use distinctive amounts you can grep later. `30123456781` is a CUIT with merchant master
+data (Supermercados del Plata S.A.), so the rows also exercise the temporal join:
 
 ```bash
 docker compose exec postgres-source psql -U flink -d taxes -c "
 INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, created_at) VALUES
-  ('30692138747', 'RET_IVA',        3.50, 1234.56, 43.21, 'ACTIVE', now()),
-  ('30692138747', 'RET_IVA',        3.50, 2222.22, 77.78, 'ACTIVE', now()),
-  ('30692138747', 'RET_GANANCIAS',  2.00,  999.99, 20.00, 'ACTIVE', now());"
+  ('30123456781', 'RET_IVA',        3.50, 1234.56, 43.21, 'ACTIVE', now()),
+  ('30123456781', 'RET_IVA',        3.50, 2222.22, 77.78, 'ACTIVE', now()),
+  ('30123456781', 'RET_GANANCIAS',  2.00,  999.99, 20.00, 'ACTIVE', now());"
 ```
 
 Each row materializes into `certificate_items` once the 5 s watermark bound passes its
@@ -135,11 +135,11 @@ the earlier rows consolidate immediately:
 # after ~1-2 minutes, flush the open window:
 docker compose exec postgres-source psql -U flink -d taxes -c "
 INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, created_at)
-VALUES ('30692138747', 'RET_IVA', 3.50, 555.55, 19.44, 'ACTIVE', now());"
+VALUES ('30123456781', 'RET_IVA', 3.50, 555.55, 19.44, 'ACTIVE', now());"
 ```
 
 Observed: the two `RET_IVA` rows consolidated into a single certificate
-(`total_base_tax = 3456.78`, i.e. 1234.56 + 2222.22) with `merchant_name = Farmacity
+(`total_base_tax = 3456.78`, i.e. 1234.56 + 2222.22) with `merchant_name = Supermercados del Plata
 S.A.` and `establishment = 10001`; the `RET_GANANCIAS` row produced its own row. The
 flusher row itself stayed in the open window until the next event arrived — expected
 behavior with allowed lateness 0.
@@ -226,8 +226,8 @@ the next submission — restore or not — resumes from the slot position.
 ```bash
 docker compose exec postgres-source psql -U flink -d taxes -c "
 INSERT INTO tax_calculations (cuit, tax_id, tax_rate, base_tax, tax_amount, tax_status, created_at) VALUES
-  ('30692138747', 'RET_IVA',       3.50, 4444.44, 155.55, 'ACTIVE', now()),
-  ('30692138747', 'RET_GANANCIAS', 2.00, 3333.33,  66.66, 'ACTIVE', now());"
+  ('30123456781', 'RET_IVA',       3.50, 4444.44, 155.55, 'ACTIVE', now()),
+  ('30123456781', 'RET_GANANCIAS', 2.00, 3333.33,  66.66, 'ACTIVE', now());"
 ```
 
 Nothing consumes them yet: they accumulate in the source WAL behind the replication
@@ -239,7 +239,7 @@ still returns the pre-stop count).
 ```bash
 docker compose exec jobmanager \
   flink run -s /opt/flink/checkpoints/savepoints/savepoint-<jobId8>-<savepoint-hash> \
-  -c com.maxipalacios.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar
+  -c com.example.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar
 ```
 
 - Try it **without** `-n` / `--allowNonRestoredState` first. In the exercise the restore

@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes.e2e;
+package com.example.taxes.e2e;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
@@ -13,8 +13,8 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
-import com.maxipalacios.taxes.CertificationPeriod;
-import com.maxipalacios.taxes.TaxJob;
+import com.example.taxes.CertificationPeriod;
+import com.example.taxes.TaxJob;
 
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -26,12 +26,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import static com.maxipalacios.taxes.e2e.E2eFixtures.atEpochSecond;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.countTargetRows;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculation;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
+import static com.example.taxes.e2e.E2eFixtures.atEpochSecond;
+import static com.example.taxes.e2e.E2eFixtures.countTargetRows;
+import static com.example.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculation;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
+import static com.example.taxes.e2e.E2eFixtures.waitForWatermarkTickGap;
 
 /**
  * End-to-end tests for issue #6: runs the certificate consolidation job with
@@ -133,13 +133,13 @@ class MerchantEnrichmentE2eTest {
 
     // Seeded merchants (docker/postgres/source/init.sql); the seed values are
     // pinned here so as-of expectations cannot drift from the seed silently.
-    private static final String FARMACITY_CUIT = "30692138747";
-    private static final String FARMACITY_NAME = "Farmacity S.A.";
-    private static final String FARMACITY_ESTABLISHMENT = "10001";
+    private static final String DEL_PLATA_CUIT = "30123456781";
+    private static final String DEL_PLATA_NAME = "Supermercados del Plata S.A.";
+    private static final String DEL_PLATA_ESTABLISHMENT = "10001";
 
-    private static final String CARREFOUR_CUIT = "30584620389";
-    private static final String CARREFOUR_UPDATED_NAME = "Carrefour Express";
-    private static final String CARREFOUR_UPDATED_ESTABLISHMENT = "10999";
+    private static final String ANDINO_CUIT = "33123456780";
+    private static final String ANDINO_UPDATED_NAME = "Comercio Andino Express";
+    private static final String ANDINO_UPDATED_ESTABLISHMENT = "10999";
 
     private static final String ALMACENES_CUIT = "23123456783";
     private static final String ALMACENES_UPDATED_NAME = "Almacenes del Sur II";
@@ -200,7 +200,7 @@ class MerchantEnrichmentE2eTest {
             // certification period no matter which second the test runs at.
             deleteSeedTaxCalculations(pair);
             long minuteStart = Instant.now().getEpochSecond() / 60 * 60 - 600;
-            insertSourceCalculationAt(pair, FARMACITY_CUIT, TAX_ID_RET_IVA, SNAPSHOT_RATE_4_25,
+            insertSourceCalculationAt(pair, DEL_PLATA_CUIT, TAX_ID_RET_IVA, SNAPSHOT_RATE_4_25,
                     SNAPSHOT_BASE, SNAPSHOT_AMOUNT, minuteStart + 30);
 
             result = startConsolidationJob(pair);
@@ -234,7 +234,7 @@ class MerchantEnrichmentE2eTest {
             await().atMost(SNAPSHOT_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
-                        List<RateLine> lines = linesFor(fetchRateLines(pair, FARMACITY_CUIT),
+                        List<RateLine> lines = linesFor(fetchRateLines(pair, DEL_PLATA_CUIT),
                                 TAX_ID_RET_IVA, SNAPSHOT_RATE_4_25, atEpochSecond(minuteStart));
                         assertEquals(1, lines.size(),
                                 "the snapshot withholding must consolidate into exactly one closed rate line");
@@ -267,7 +267,7 @@ class MerchantEnrichmentE2eTest {
             insertSourceCalculation(pair, MERCHANTLESS_CUIT, TAX_ID_PER_IVA, PER_TICK_RATE_21_00,
                     PER_TICK_BASE, PER_TICK_AMOUNT);
             Thread.sleep(STREAM_ANCHOR_SETTLE_MILLIS);
-            insertSourceCalculation(pair, FARMACITY_CUIT, TAX_ID_RET_IVA, STREAMING_RATE_6_75,
+            insertSourceCalculation(pair, DEL_PLATA_CUIT, TAX_ID_RET_IVA, STREAMING_RATE_6_75,
                     STREAMING_BASE, STREAMING_AMOUNT);
             insertSourceCalculation(pair, MERCHANTLESS_CUIT, TAX_ID_RET_IVA, MERCHANTLESS_RATE_3_50,
                     MERCHANTLESS_BASE, MERCHANTLESS_AMOUNT);
@@ -281,7 +281,7 @@ class MerchantEnrichmentE2eTest {
             await().atMost(STREAMING_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
-                        List<RateLine> all = fetchRateLines(pair, FARMACITY_CUIT);
+                        List<RateLine> all = fetchRateLines(pair, DEL_PLATA_CUIT);
                         List<RateLine> closedLines = linesFor(all, TAX_ID_RET_IVA, SNAPSHOT_RATE_4_25,
                                 atEpochSecond(minuteStart));
                         List<RateLine> streamingLines = withRate(all, STREAMING_RATE_6_75);
@@ -311,9 +311,9 @@ class MerchantEnrichmentE2eTest {
                                         + "snapshot line");
                         assertEquals(streamingLine.windowStart().toInstant().plusSeconds(60),
                                 streamingLine.windowEnd().toInstant(), "window_end must be window_start + 60s");
-                        assertEquals(FARMACITY_ESTABLISHMENT, streamingLine.establishment(),
+                        assertEquals(DEL_PLATA_ESTABLISHMENT, streamingLine.establishment(),
                                 "establishment must be the merchant state as of the withholding's created_at");
-                        assertEquals(FARMACITY_NAME, streamingLine.merchantName(),
+                        assertEquals(DEL_PLATA_NAME, streamingLine.merchantName(),
                                 "merchant_name must be the merchant state as of the withholding's created_at");
                         assertEquals(0, STREAMING_BASE.compareTo(streamingLine.totalBaseTax()),
                                 "the streaming line must hold its exact single-row totals");
@@ -402,7 +402,7 @@ class MerchantEnrichmentE2eTest {
             // First withholding, created_at defaults to now(): strictly after
             // the merchants snapshot read (so its as-of version is the seed
             // one) and strictly before the update below commits.
-            insertSourceCalculation(pair, CARREFOUR_CUIT, TAX_ID_RET_IIBB_CABA, IIBB_RATE_2_00,
+            insertSourceCalculation(pair, ANDINO_CUIT, TAX_ID_RET_IIBB_CABA, IIBB_RATE_2_00,
                     MID_PERIOD_BASE_1, MID_PERIOD_AMOUNT_1);
 
             // The mid-period merchant change: commits between the two
@@ -410,12 +410,12 @@ class MerchantEnrichmentE2eTest {
             // -U/+U pair; the versioned state keeps the pre-update version
             // under the snapshot read's op_ts and the new version under the
             // update's op_ts.
-            updateMerchant(pair, CARREFOUR_CUIT, CARREFOUR_UPDATED_NAME, CARREFOUR_UPDATED_ESTABLISHMENT);
+            updateMerchant(pair, ANDINO_CUIT, ANDINO_UPDATED_NAME, ANDINO_UPDATED_ESTABLISHMENT);
 
             // Second withholding, created_at defaults to now(): strictly after
             // the update's commit (so its as-of version is the new one) and
             // still inside the same open period thanks to the headroom guard.
-            insertSourceCalculation(pair, CARREFOUR_CUIT, TAX_ID_RET_IIBB_CABA, IIBB_RATE_2_00,
+            insertSourceCalculation(pair, ANDINO_CUIT, TAX_ID_RET_IIBB_CABA, IIBB_RATE_2_00,
                     MID_PERIOD_BASE_2, MID_PERIOD_AMOUNT_2);
 
             waitForWatermarkTickGap();
@@ -427,7 +427,7 @@ class MerchantEnrichmentE2eTest {
             await().atMost(STREAMING_CONVERGENCE)
                     .pollInterval(Duration.ofSeconds(1))
                     .untilAsserted(() -> {
-                        List<RateLine> all = fetchRateLines(pair, CARREFOUR_CUIT);
+                        List<RateLine> all = fetchRateLines(pair, ANDINO_CUIT);
                         List<RateLine> lines = linesFor(all, TAX_ID_RET_IIBB_CABA, IIBB_RATE_2_00, periodStartTime);
                         assertEquals(1, lines.size(),
                                 () -> "both withholdings must upsert the single open-period rate line; got "
@@ -443,11 +443,11 @@ class MerchantEnrichmentE2eTest {
                         // enrichment — a withholding created before the
                         // merchants snapshot read — would be skipped by
                         // LAST_VALUE and could never clobber the line.)
-                        assertEquals(CARREFOUR_UPDATED_ESTABLISHMENT, line.establishment(),
+                        assertEquals(ANDINO_UPDATED_ESTABLISHMENT, line.establishment(),
                                 "establishment must be the last merchant version seen in the period");
-                        assertEquals(CARREFOUR_UPDATED_NAME, line.merchantName(),
+                        assertEquals(ANDINO_UPDATED_NAME, line.merchantName(),
                                 "merchant_name must be the last merchant version seen in the period");
-                        assertEquals(1, countPrimaryKeyRows(pair, CARREFOUR_CUIT, TAX_ID_RET_IIBB_CABA,
+                        assertEquals(1, countPrimaryKeyRows(pair, ANDINO_CUIT, TAX_ID_RET_IIBB_CABA,
                                 periodStartTime, IIBB_RATE_2_00),
                                 "exactly one row may exist for the (cuit, tax_id, window_start, tax_rate) key");
                     });

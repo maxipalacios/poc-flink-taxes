@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes.e2e;
+package com.example.taxes.e2e;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
@@ -15,8 +15,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import com.maxipalacios.taxes.CertificationPeriod;
-import com.maxipalacios.taxes.TaxJob;
+import com.example.taxes.CertificationPeriod;
+import com.example.taxes.TaxJob;
 
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -27,11 +27,11 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
-import static com.maxipalacios.taxes.e2e.E2eFixtures.atEpochSecond;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.countTargetRows;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculation;
-import static com.maxipalacios.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
+import static com.example.taxes.e2e.E2eFixtures.atEpochSecond;
+import static com.example.taxes.e2e.E2eFixtures.countTargetRows;
+import static com.example.taxes.e2e.E2eFixtures.deleteSeedTaxCalculations;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculation;
+import static com.example.taxes.e2e.E2eFixtures.insertSourceCalculationAt;
 
 /**
  * End-to-end test for the restart-from-scratch story (spec story #22): the
@@ -135,7 +135,7 @@ class RestartFromScratchE2eTest {
     // row exists before BOTH jobs' snapshots and is never touched, so the
     // master-data side of the two runs is identical (see the class javadoc's
     // enrichment note). The merchantless cuit is absent from the seed.
-    private static final String FARMACITY_CUIT = "30692138747";
+    private static final String DEL_PLATA_CUIT = "30123456781";
     private static final String MERCHANTLESS_CUIT = "27999999994";
 
     // The perception ticks' cuit: any cuit works because PER_* rows are
@@ -233,9 +233,9 @@ class RestartFromScratchE2eTest {
      */
     private List<MoneyRow> plantBand(PostgresPair pair, long minuteStart) {
         List<MoneyRow> band = new ArrayList<>();
-        band.add(plantAt(pair, FARMACITY_CUIT, TAX_ID_RET_IVA, IVA_RATE_3_50,
+        band.add(plantAt(pair, DEL_PLATA_CUIT, TAX_ID_RET_IVA, IVA_RATE_3_50,
                 IVA_35_BASE, IVA_35_AMOUNT, minuteStart + 28));
-        band.add(plantAt(pair, FARMACITY_CUIT, TAX_ID_RET_GANANCIAS, GANANCIAS_RATE_3_00,
+        band.add(plantAt(pair, DEL_PLATA_CUIT, TAX_ID_RET_GANANCIAS, GANANCIAS_RATE_3_00,
                 GANANCIAS_BASE, GANANCIAS_AMOUNT, minuteStart + 29));
         band.add(plantAt(pair, MERCHANTLESS_CUIT, TAX_ID_RET_IVA, IVA_RATE_5_00,
                 IVA_50_BASE, IVA_50_AMOUNT, minuteStart + 30));

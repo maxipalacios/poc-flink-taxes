@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes;
+package com.example.taxes;
 
 import java.time.Duration;
 import java.time.Instant;

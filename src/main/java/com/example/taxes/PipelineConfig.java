@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes;
+package com.example.taxes;
 
 import java.util.regex.Pattern;
 

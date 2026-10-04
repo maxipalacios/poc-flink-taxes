@@ -1,4 +1,4 @@
-package com.maxipalacios.taxes;
+package com.example.taxes;
 
 /**
  * Builds the CREATE TABLE DDL of the certificate consolidation pipeline's
