@@ -101,6 +101,16 @@ public final class PostgresPair implements AutoCloseable {
         return target.getMappedPort(POSTGRES_PORT);
     }
 
+    /**
+     * Docker container id of the target, for tests that inject an
+     * infrastructure failure by stopping and starting the container through
+     * docker-java (the issue #8 checkpoint-recovery test kills the JDBC
+     * sink's database mid-run to force the job's failover).
+     */
+    public String targetContainerId() {
+        return target.getContainerId();
+    }
+
     /** Unique replication slot name for this run. */
     public String slotName() {
         return slotName;

@@ -101,6 +101,10 @@ Submit the job to the running cluster:
 docker compose exec jobmanager flink run -c com.maxipalacios.taxes.TaxJob /opt/flink/usrlib/poc-flink-taxes-0.1.0-all.jar
 ```
 
+The command needs no extra configuration: the job resolves the compose service names and
+their in-network ports from defaults (`TARGET_POSTGRES_PORT` overrides for deployments
+that publish the target differently).
+
 `build/libs` is mounted into the JobManager at `/opt/flink/usrlib`, so no manual copy is needed. If you run `gradle clean` while the cluster is up, recreate the services so the mount picks up the new build directory (`docker compose up -d --force-recreate jobmanager taskmanager`). If the `flink-checkpoints` volume was just created, make it writable by the Flink user once:
 
 ```bash
@@ -141,9 +145,17 @@ max_replication_slots=10
 
 This allows the Flink PostgreSQL CDC connector to consume the WAL through PostgreSQL logical replication.
 
-## Next steps
+## Recovery
 
-1. Create the Flink SQL source tables for `tax_calculations` and `merchants`, backed by the PostgreSQL CDC connector.
-2. Consolidate tax withholdings into certificates with an aggregation over tumbling certification periods.
-3. Upsert the resulting certificates into the target database via the JDBC connector.
-4. Enable and observe checkpoints and recovery.
+Checkpointing is enabled with a 10-second interval against the `flink-checkpoints`
+volume, so a job that fails restarts from its last completed checkpoint and keeps its
+stream position.
+
+- **Crash recovery is proven automatically** by `CheckpointRecoveryE2eTest`: a mid-run
+  task failure triggers the restart-strategy failover from the last completed
+  checkpoint, and the test asserts the target converges without duplicate or missing
+  rate lines.
+- **Planned stops and upgrades** (deploy a new JAR, change configuration) use the
+  savepoint → stop → restore flow. The runbook with exact commands and the real observed
+  outputs from a full cycle — including the proof that the CDC snapshot is not re-run —
+  lives in [docs/savepoint-restore-exercise.md](docs/savepoint-restore-exercise.md).

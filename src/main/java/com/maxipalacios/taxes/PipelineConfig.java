@@ -43,7 +43,15 @@ public record PipelineConfig(
                 envOr("SOURCE_POSTGRES_HOST", "postgres-source"),
                 envOr("SOURCE_POSTGRES_PORT", "5432"),
                 envOr("TARGET_POSTGRES_HOST", "postgres-target"),
-                envOr("TARGET_POSTGRES_PORT", "5433"),
+                // 5432, not the compose host mapping 5433: the job runs
+                // INSIDE the cluster network (flink run from the jobmanager
+                // container), where the postgres-target service listens on
+                // its physical 5432. The default must be the in-network port
+                // so the documented plain `flink run` works without env vars
+                // (issue #8's savepoint exercise hit the 5433 crash loop);
+                // deployments that publish the target differently override
+                // this via TARGET_POSTGRES_PORT.
+                envOr("TARGET_POSTGRES_PORT", "5432"),
                 envOr("POSTGRES_DB", "taxes"),
                 envOr("POSTGRES_USER", "flink"),
                 envOr("POSTGRES_PASSWORD", "flink"),

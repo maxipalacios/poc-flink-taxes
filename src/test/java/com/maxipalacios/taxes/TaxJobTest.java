@@ -65,4 +65,18 @@ class TaxJobTest {
                 assertThrows(IllegalArgumentException.class, () -> TaxJob.certificationPeriodArg(new String[]{"--certification-period", ""}));
         assertEquals(TaxJob.USAGE, separatedForm.getMessage());
     }
+
+    /**
+     * Pins {@link TaxJob#CHECKPOINT_INTERVAL_MS} at the 10-second interval
+     * issue #8's acceptance criterion requires ("checkpointing remains
+     * enabled at 10-second intervals"). Honest scope: a cluster-free unit
+     * test can only pin the constant's VALUE — that the pipeline really
+     * checkpoints (and recovers from its checkpoints) at this interval is
+     * what {@code CheckpointRecoveryE2eTest} proves against the real mini
+     * cluster.
+     */
+    @Test
+    void pinsTheProductionCheckpointInterval() {
+        assertEquals(10_000L, TaxJob.CHECKPOINT_INTERVAL_MS);
+    }
 }

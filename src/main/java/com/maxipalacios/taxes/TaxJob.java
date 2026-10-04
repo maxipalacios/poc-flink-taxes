@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
@@ -43,6 +44,16 @@ public final class TaxJob {
     static final String USAGE =
             "Usage: TaxJob [--certification-period <spec>] where <spec> is '<n>s' (n >= 1, e.g. '60s'), 'daily' or 'monthly'";
 
+    // CDC incremental snapshots commit read chunks on checkpoints, so the
+    // production job enables checkpointing before the table environment
+    // exists (see main). Issue #8 pins the 10-second interval as an
+    // acceptance criterion ("checkpointing remains enabled at 10-second
+    // intervals"), so the value lives in this one constant, which feeds both
+    // main() and the checkpoint-recovery e2e test: the failover that test
+    // injects restores from checkpoints taken at exactly the production
+    // cadence, and this constant keeps the two from drifting apart.
+    public static final long CHECKPOINT_INTERVAL_MS = 10_000;
+
     private TaxJob() {
     }
 
@@ -52,7 +63,16 @@ public final class TaxJob {
 
         // CDC incremental snapshots commit read chunks on checkpoints, so
         // checkpointing must be enabled before the table environment exists.
-        env.enableCheckpointing(10_000);
+        env.enableCheckpointing(CHECKPOINT_INTERVAL_MS);
+
+        // Recovery is proven, not assumed (issue #8): pin the fixed-delay
+        // strategy the checkpoint-recovery e2e test exercises, instead of
+        // relying on the cluster's implicit default for checkpointing jobs.
+        // Unbounded attempts: a killed TaskManager must always fail over from
+        // the last completed checkpoint; a persistent failure still surfaces
+        // as a permanently RESTARTING job in the Flink UI and logs.
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(
+                Integer.MAX_VALUE, Duration.ofSeconds(1)));
 
         // Env vars stay the single configuration surface (fromEnv); the
         // optional --certification-period flag only overrides the period spec.
