@@ -78,9 +78,7 @@ final class PipelineDdl {
                         cfg.source().host(),
                         cfg.source().port(),
                         cfg.source().username(),
-                        // Safe to interpolate: DbConnection rejected single quotes,
-                        // backslashes, semicolons and newlines, so the value stays
-                        // inside this single-quoted literal.
+                        // Interpolation-safe: see the class javadoc.
                         cfg.source().password(),
                         cfg.source().databaseName(),
                         cfg.replicationSlotName());
@@ -149,9 +147,7 @@ final class PipelineDdl {
                         cfg.source().host(),
                         cfg.source().port(),
                         cfg.source().username(),
-                        // Safe to interpolate: DbConnection rejected single quotes,
-                        // backslashes, semicolons and newlines, so the value stays
-                        // inside this single-quoted literal.
+                        // Interpolation-safe: see the class javadoc.
                         cfg.source().password(),
                         cfg.source().databaseName(),
                         cfg.merchantsReplicationSlotName());
@@ -196,9 +192,7 @@ final class PipelineDdl {
                         cfg.target().port(),
                         cfg.target().databaseName(),
                         cfg.target().username(),
-                        // Safe to interpolate: DbConnection rejected single quotes,
-                        // backslashes, semicolons and newlines, so the value stays
-                        // inside this single-quoted literal.
+                        // Interpolation-safe: see the class javadoc.
                         cfg.target().password());
     }
 }

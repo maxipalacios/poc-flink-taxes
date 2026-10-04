@@ -113,19 +113,17 @@ COMMIT;
 -- pipeline connects as this dedicated role instead (see README, credentials).
 -- Grants, one per pipeline need:
 --   REPLICATION  consume the logical replication slots (WAL streaming)
---   CREATE       create publications as a non-superuser — pgoutput needs a
---                publication per CDC source. Note PostgreSQL 17 gates
---                publication management on superuser or table ownership
---                (`FOR ALL TABLES` requires superuser; adding a table to a
---                publication requires owning it — probe-verified), which
---                flink_cdc deliberately lacks; the publications are therefore
---                pre-created by the admin below and the connector must run
---                with publication autocreation disabled.
 --   SELECT       read all tables during the initial snapshot scan
+-- Deliberately NOT granted: CREATE on the database. pgoutput needs a
+-- publication per CDC source, but PostgreSQL 17 gates publication management
+-- on superuser or table ownership (`FOR ALL TABLES` requires superuser;
+-- adding a table to a publication requires owning it — probe-verified),
+-- which flink_cdc deliberately lacks; the publications are therefore
+-- pre-created by the admin below and the connector runs with publication
+-- autocreation disabled.
 -- ============================================================================
 CREATE ROLE flink_cdc LOGIN PASSWORD 'flink' REPLICATION;
 GRANT CONNECT ON DATABASE taxes TO flink_cdc;
-GRANT CREATE ON DATABASE taxes TO flink_cdc;
 GRANT USAGE ON SCHEMA public TO flink_cdc;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO flink_cdc;
 
